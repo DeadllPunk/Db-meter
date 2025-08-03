@@ -208,6 +208,7 @@ local function update_fog_system(track_index, audio_level, dt, meter_x, meter_y,
     sys.level = audio_level or 0
     local region_top = meter_y
     local region_bottom = meter_y + meter_height
+    local region_height = meter_height
     local time = reaper.time_precise() or 0
     -- Обновляем частицы тумана
     for _, p in ipairs(sys.fog) do
@@ -1418,6 +1419,8 @@ function UpdateFXParticlesFL(track_index, level, meter_x, meter_y, meter_width, 
         particles_to_create = math.max(1, particles_to_create)
     end
     
+    -- ВРЕМЕННО ОТКЛЮЧЕНО: создание кластера пикселей
+    --[[
     for i = 1, particles_to_create do
         if #system.pixels < PIXEL_CONFIG.max_particles then
             -- Создаем частицы строго в пределах meter_min/max границ
@@ -1439,6 +1442,7 @@ function UpdateFXParticlesFL(track_index, level, meter_x, meter_y, meter_width, 
             end
         end
     end
+    --]]
     
     return 0  -- Возвращаем 0 вместо сложного расчета давления
 end

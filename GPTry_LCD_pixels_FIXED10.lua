@@ -186,12 +186,12 @@ local function init_fog_system(track_index, meter_x, meter_y, meter_width, meter
         local cols = math.ceil(meter_width / size)
         local rows = math.ceil(meter_height / size)
         for row = 0, rows - 1 do
-            -- relative_y: 0 = верх, 1 = низ (как используется при вычислении позиции)
-            local rel = 1 - (row / math.max(1, rows - 1))
+            -- Располагаем частицы по сетке от низа к верху, используя абсолютные координаты
+            local py = meter_y + meter_height - row * size - size / 2
             for col = 0, cols - 1 do
                 local px = meter_x + col * size + size / 2
                 local phase = math.random() * 2 * math.pi
-                table.insert(fog_particles, {x = px, base_x = px, relative_y = rel, phase = phase})
+                table.insert(fog_particles, {x = px, base_x = px, y = py, phase = phase})
             end
         end
         fog_systems[track_index] = {fog = fog_particles, bursts = {}}
@@ -204,38 +204,35 @@ local function update_fog_system(track_index, audio_level, dt, meter_x, meter_y,
     init_fog_system(track_index, meter_x, meter_y, meter_width, meter_height)
     local sys = fog_systems[track_index]
     if not sys then return end
-    -- Store the current audio level so it can be used in the draw call
+    -- Сохраняем уровень для использования при отрисовке
     sys.level = audio_level or 0
-    -- Define the vertical region in which fog particles should reside. The top of the region
-    -- is the bar (peak) position, or the top of the meter if no bar is provided. The bottom
-    -- is the bottom of the meter.
-    local region_top = bar_y or meter_y
+    local region_top = meter_y
     local region_bottom = meter_y + meter_height
-    local region_height = region_bottom - region_top
+    local region_height = meter_height
     local time = reaper.time_precise() or 0
-    -- Update fog particles
+    -- Обновляем частицы тумана
     for _, p in ipairs(sys.fog) do
-        -- Обновляем относительную высоту, создавая эффект подъёма дыма
-        local rise = (FOG_CONFIG.rise_speed + (audio_level or 0) * FOG_CONFIG.level_rise_mult) * dt
-        p.relative_y = p.relative_y - rise
-        -- Когда частица достигает верхней границы, переносим её в основание столбца
-        while p.relative_y < 0 do
-            p.relative_y = p.relative_y + 1
+        -- Постоянное плавное "всплытие" вверх
+        local rise = (FOG_CONFIG.rise_speed + (audio_level or 0) * FOG_CONFIG.level_rise_mult) * meter_height * dt
+        p.y = p.y - rise
+        -- Возвращаем частицу в низ, если она ушла выше верхней границы
+        while p.y < region_top do
+            p.y = p.y + meter_height
             p.base_x = meter_x + math.random() * meter_width
             p.phase = math.random() * 2 * math.pi
         end
-        -- Вертикальное колыхание, зависящее от уровня сигнала
+        -- Колыхание от сигнала
         local vert_amp = (audio_level or 0) * FOG_CONFIG.vertical_wave_amp
         local vertical_offset = math.sin(time * FOG_CONFIG.wave_speed * 2 + p.phase) * vert_amp
-        -- Пересчитываем абсолютные координаты
-        p.y = region_top + (p.relative_y or 0) * region_height + vertical_offset
+        local final_y = p.y + vertical_offset
         p.x = p.base_x + math.sin(time * FOG_CONFIG.wave_speed + p.phase) * FOG_CONFIG.wave_amplitude
-        -- Ограничиваем частицы границами столбца
+        -- Ограничиваем частицу рамками и планкой, не растягивая массив
         local radius = (FOG_CONFIG.particle_size or 4) / 2
+        if bar_y and final_y < bar_y + radius then final_y = bar_y + radius end
+        if final_y > region_bottom - radius then final_y = region_bottom - radius end
         if p.x < meter_x + radius then p.x = meter_x + radius end
         if p.x > meter_x + meter_width - radius then p.x = meter_x + meter_width - radius end
-        if p.y > region_bottom - radius then p.y = region_bottom - radius end
-        if p.y < region_top then p.y = region_top end
+        p.y = final_y
     end
     -- Update bursts (disabled by configuration)
     for i = #sys.bursts, 1, -1 do
@@ -265,7 +262,7 @@ local function draw_fog_system(ctx, x, y, track_index, meter_width, meter_height
     local dl = reaper.ImGui_GetWindowDrawList(ctx)
     -- Определяем текущий уровень аудио для управления яркостью
     local level = sys.level or 0
-    -- Рисуем дым как маленькие квадратики LCD. Они заполняют столбик до планки.
+    -- Рисуем дым мягкими кружками, создавая более «дымный» эффект
     for _, p in ipairs(sys.fog) do
         -- frequency_factor зависит от вертикальной позиции: нижние части синее, верхние более циан
         local freq_factor = 0
@@ -273,11 +270,20 @@ local function draw_fog_system(ctx, x, y, track_index, meter_width, meter_height
             freq_factor = (p.y - y) / meter_height
             freq_factor = math.max(0.0, math.min(1.0, freq_factor))
         end
-        -- Интенсивность зависит от общего уровня сигнала и может слегка уменьшаться кверху
-        local intensity = level
-        -- Рисуем квадрат со стороной, определяемой конфигурацией
         local size = FOG_CONFIG.particle_size or 4
-        draw_lcd_pixel(dl, p.x - size/2, p.y - size/2, size, size, intensity, freq_factor)
+        local radius = size / 2
+        -- Прозрачность усиливается уровнем сигнала
+        local alpha = FOG_CONFIG.fog_alpha * (0.5 + 0.5 * level)
+        alpha = math.min(1.0, math.max(0.0, alpha))
+        local outer_alpha = math.floor(alpha * 255 * 0.5)
+        local inner_alpha = math.floor(alpha * 255)
+        -- Легкая вертикальная градация оттенка, чтобы туман не выглядел полностью плоским
+        local base = 180 + math.floor(20 * freq_factor)
+        local r, g, b = base, base, base
+        local outer_color = (r << 24) | (g << 16) | (b << 8) | outer_alpha
+        local inner_color = (r << 24) | (g << 16) | (b << 8) | inner_alpha
+        reaper.ImGui_DrawList_AddCircleFilled(dl, p.x, p.y, radius, outer_color)
+        reaper.ImGui_DrawList_AddCircleFilled(dl, p.x, p.y, radius * 0.6, inner_color)
     end
     -- Рисуем всплески (если включены) как LCD‑пиксели
     for _, b in ipairs(sys.bursts) do
@@ -326,8 +332,12 @@ local function update_bounce_system(track_index, audio_level, dt, bar_y, meter_x
         -- Spawn particles from the bottom of the meter so they travel up toward the bar
         local radius = BOUNCE_CONFIG.size or 0
         local spawn_y = meter_y + meter_height - radius - 1
-        -- Initial vertical velocity is upward (negative in screen coordinates)
-        local vy = -(audio_level * BOUNCE_CONFIG.init_speed + math.random() * 40)
+        -- Рассчитываем скорость так, чтобы частица гарантированно достигла планки
+        local distance = spawn_y - (bar_y or meter_y)
+        if distance < 0 then distance = 0 end
+        local min_speed = math.sqrt(2 * BOUNCE_CONFIG.gravity * distance)
+        -- Добавляем зависимость от уровня сигнала и небольшой разброс
+        local vy = -(min_speed + audio_level * BOUNCE_CONFIG.init_speed + math.random() * 20)
         table.insert(list, {x = px, y = spawn_y, vy = vy, alpha = 1.0})
     end
 
@@ -1409,6 +1419,8 @@ function UpdateFXParticlesFL(track_index, level, meter_x, meter_y, meter_width, 
         particles_to_create = math.max(1, particles_to_create)
     end
     
+    -- ВРЕМЕННО ОТКЛЮЧЕНО: создание кластера пикселей
+    --[[
     for i = 1, particles_to_create do
         if #system.pixels < PIXEL_CONFIG.max_particles then
             -- Создаем частицы строго в пределах meter_min/max границ
@@ -1430,6 +1442,7 @@ function UpdateFXParticlesFL(track_index, level, meter_x, meter_y, meter_width, 
             end
         end
     end
+    --]]
     
     return 0  -- Возвращаем 0 вместо сложного расчета давления
 end

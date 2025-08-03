@@ -1333,118 +1333,80 @@ local function get_track_audio_level(track_index)
 end
 
 -- FL-style функция обновления частиц с жесткими границами метра
-function UpdateFXParticlesFL(track_index, level, meter_x, meter_y, meter_width, meter_height, handle_y)
-    -- Используем пиксельную систему вместо fx_particles
-    local system = init_pixel_system(track_index, meter_width, meter_height)
-    local current_time = reaper.time_precise()
-    local delta_time = 1.0 / 60.0
-    
-    -- Определяем границы метра используя ImGui.GetItemRectMin/Max подход
-    local margin = 3
-    local meter_min_x = meter_x + margin
-    local meter_max_x = meter_x + meter_width - margin
-    local meter_min_y = meter_y + margin
-    local meter_max_y = meter_y + meter_height - margin
-    
-    -- Фильтрация мертвых частиц и обновление живых
-    for i = #system.pixels, 1, -1 do
-        local particle = system.pixels[i]
-        
-        -- Обновляем время жизни частицы
-        particle.life = particle.life - delta_time
-        
-        -- Простая физика: движение вверх с гравитацией
-        particle.velocity_y = particle.velocity_y + particle.gravity * delta_time
-        local new_y = particle.y + particle.velocity_y * delta_time
-        
-        -- Обновляем горизонтальную позицию с учетом velocity_x
-        local new_x = particle.x + particle.velocity_x * delta_time
-        
-        -- Обновляем позицию
-        particle.x = new_x
-        particle.y = new_y
-        
-        -- Отскоки от границ метра (как в GPTDb метр новый)
-        -- Отскок от левой и правой стенок
-        if particle.x <= meter_min_x or particle.x >= meter_max_x then
-            particle.velocity_x = -particle.velocity_x * 0.5  -- Отскок с затуханием
-            particle.x = math.max(meter_min_x, math.min(meter_max_x, particle.x))
+function UpdateFXParticlesFL(track_index, level, meter_x, meter_y, meter_width, meter_height, bar_y)
+    -- Система частиц дыма для данного трека
+    if not fx_particles[track_index] then
+        fx_particles[track_index] = {}
+    end
+    local particles = fx_particles[track_index]
+
+    local dt = 1.0 / 60.0
+    local time = reaper.time_precise()
+
+    -- Геометрия зон
+    local spawn_zone_top = meter_y + meter_height * 0.66
+    local spawn_zone_bottom = meter_y + meter_height - 5
+    local max_y_limit = (bar_y or meter_y) - 2
+
+    -- Обновление частиц
+    for i = #particles, 1, -1 do
+        local p = particles[i]
+        p.age = p.age + dt
+
+        p.y = p.y - (p.vy * dt) / p.mass
+        p.x = p.x + p.vx * dt + math.sin(time * 2 + p.wobble_phase) * 0.5 * (1 / p.mass)
+
+        if p.x < meter_x then p.x = meter_x end
+        if p.x > meter_x + meter_width then p.x = meter_x + meter_width end
+        if p.y < max_y_limit then p.y = max_y_limit end
+
+        local denom = max_y_limit - spawn_zone_top
+        local height_factor = 0
+        if denom ~= 0 then
+            height_factor = (p.y - spawn_zone_top) / denom
         end
-        
-        -- Отскок от верха и низа метра
-        if particle.y <= meter_min_y then
-            particle.velocity_y = -particle.velocity_y * 0.5  -- Отскок от верха
-            particle.y = meter_min_y
-        elseif particle.y >= meter_max_y then
-            particle.velocity_y = -particle.velocity_y * 0.5  -- Отскок от низа
-            particle.y = meter_max_y
-            -- Добавляем небольшое боковое отклонение при отскоке от дна
-            particle.velocity_x = particle.velocity_x + (math.random() - 0.5) * 5
-        end
-        
-        -- Взаимодействие с ползунком дБ (если позиция передана)
-        if handle_y and particle.velocity_y < 0 then  -- Частица движется вверх
-            local handle_tolerance = 5  -- Толщина области взаимодействия с ползунком
-            -- Проверяем, находится ли частица в зоне ползунка
-            if particle.y <= handle_y + handle_tolerance and particle.y >= handle_y - handle_tolerance then
-                -- Отскок от ползунка вниз
-                particle.velocity_y = -math.abs(particle.velocity_y) * 0.8  -- Отскок вниз с затуханием
-                particle.y = handle_y + handle_tolerance  -- Позиционируем ниже ползунка
-                -- Добавляем небольшое боковое отклонение при отскоке от ползунка
-                particle.velocity_x = particle.velocity_x + (math.random() - 0.5) * 10
-            end
-        end
-        
-        -- Затухание скоростей
-        particle.velocity_x = particle.velocity_x * 0.98
-        particle.velocity_y = particle.velocity_y * 0.995
-        
-        -- Обновляем альфа-канал (затухание)
-        particle.alpha = particle.alpha * PIXEL_CONFIG.fade_speed
-        
-        -- Удаляем мертвые частицы (вышедшие за границы, прозрачные или проживших слишком долго)
-        local out_of_bounds = particle.x < meter_min_x or particle.x > meter_max_x or
-                             particle.y < meter_min_y or particle.y > meter_max_y
-        local is_dead = out_of_bounds or particle.alpha < 0.01 or particle.life <= 0
-        
-        if is_dead then
-            table.remove(system.pixels, i)
+        if height_factor < 0 then height_factor = 0 elseif height_factor > 1 then height_factor = 1 end
+        p.alpha = p.brightness * (1 - height_factor)^1.5 * (1 - (p.age / p.max_age)^1.2)
+
+        if p.age > p.max_age or p.alpha <= 0 or p.y > spawn_zone_bottom then
+            table.remove(particles, i)
         end
     end
-    
-    -- Создаем новые частицы на основе уровня аудио
-    local particles_to_create = 0
-    if level > 0.001 then
-        particles_to_create = math.floor(level * PIXEL_CONFIG.max_particles * delta_time * 20)
-        particles_to_create = math.max(1, particles_to_create)
-    end
-    
-    -- ВРЕМЕННО ОТКЛЮЧЕНО: создание кластера пикселей
-    --[[
-    for i = 1, particles_to_create do
-        if #system.pixels < PIXEL_CONFIG.max_particles then
-            -- Создаем частицы строго в пределах meter_min/max границ
-            local safe_width = meter_max_x - meter_min_x
-            local safe_height = meter_max_y - meter_min_y
-            
-            if safe_width > 0 and safe_height > 0 then
-                local pixel_x = meter_min_x + (math.random() * safe_width)
-            local pixel_y = meter_max_y - (math.random() * 10) -- Появляются в нижней части
-            local pixel = create_pixel(
-                pixel_x, pixel_y, level, level, 
-                meter_width, meter_min_x, meter_min_y, meter_height
-            )
-            
-            -- Устанавливаем базовую позицию для движения в безопасной зоне
-            pixel.base_x = pixel_x
-            
-            table.insert(system.pixels, pixel)
-            end
+
+    -- Порождение новых частиц при достаточном сигнале
+    local max_particles = 160
+    if level > 0.01 then
+        local spawn_count = math.floor(level * 25)
+        for i = 1, spawn_count do
+            if #particles >= max_particles then break end
+            local x = meter_x + math.random() * meter_width
+            local y = spawn_zone_bottom - math.random() * (spawn_zone_bottom - spawn_zone_top)
+            local radius = math.random(4, 12)
+            local p = {
+                x = x,
+                y = y,
+                radius = radius,
+                alpha = 1.0,
+                vx = (math.random() - 0.5) * 10,
+                vy = 20 + math.random() * 20,
+                age = 0,
+                max_age = 2.0 + math.random() * 2.0,
+                mass = 0.8 + math.random() * 0.7,
+                brightness = 0.6 + math.random() * 0.4,
+                wobble_phase = math.random() * math.pi * 2
+            }
+            table.insert(particles, p)
         end
     end
-    --]]
-    
-    return 0  -- Возвращаем 0 вместо сложного расчета давления
+
+    -- Отрисовка
+    local draw_list = reaper.ImGui_GetWindowDrawList(ctx)
+    for _, p in ipairs(particles) do
+        local col = reaper.ImColor(200, 200, 200, math.floor(p.alpha * 255))
+        reaper.ImGui_DrawList_AddCircleFilled(draw_list, p.x, p.y, p.radius, col)
+    end
+
+    return 0
 end
 
 -- Функция отрисовки пиксельной системы
@@ -4678,19 +4640,21 @@ local function loop()
             -- используем функцию UpdateFXParticlesFL, которая порождает новые частицы для dB‑метра
             -- Используем сохраненную позицию слайдера из предыдущего кадра
             local saved_handle_y = handle_positions[i] or (meter_min_y + meter_height * 0.8) -- fallback позиция
-            local pressure = UpdateFXParticlesFL(i, level, 
-                meter_min_x, 
+
+            -- Сначала рисуем пиксельную систему метра
+            DrawPixelSystem(i, reaper.ImGui_GetWindowDrawList(ctx),
+                meter_min_x,
                 meter_min_y,
-                meter_width, 
+                meter_width,
+                meter_height)
+
+            -- Затем обновляем и рисуем дым поверх
+            local pressure = UpdateFXParticlesFL(i, level,
+                meter_min_x,
+                meter_min_y,
+                meter_width,
                 meter_height,
                 saved_handle_y)
-            
-            -- Отрисовываем пиксельную систему ПОСЛЕ метра, чтобы она была поверх
-            DrawPixelSystem(i, reaper.ImGui_GetWindowDrawList(ctx), 
-                meter_min_x, 
-                meter_min_y, 
-                meter_width, 
-                meter_height)
             -- =========== /СПЕКТРАЛЬНЫЙ МЕТР ===========
             
             reaper.ImGui_SetCursorPosX(ctx, slider_x)

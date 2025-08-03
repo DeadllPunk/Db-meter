@@ -153,11 +153,19 @@ local handle_positions = {}
 -- отключены, т.к. роль вспрыгивающих пикселей выполняет
 -- отдельная bounce‑система.
 local FOG_CONFIG = {
-    num_fog_particles = 100,    -- количество частиц дымка (увеличено для заполнения столбца)
-    wave_speed = 0.2,          -- скорость горизонтальной волны
-    wave_amplitude = 3.0,      -- амплитуда горизонтальной волны
-    vertical_wave_amp = 10.0,  -- амплитуда вертикального смещения, усиливается уровнем аудио
-    fog_alpha = 0.35,          -- базовая прозрачность частиц
+    -- размер частицы в пикселях (также используется для расчёта сетки)
+    particle_size = 4,
+    -- скорость горизонтальной волны
+    wave_speed = 0.2,
+    wave_amplitude = 3.0,
+    -- амплитуда вертикального смещения, усиливается уровнем аудио
+    vertical_wave_amp = 10.0,
+    -- базовая прозрачность частиц
+    fog_alpha = 0.35,
+    -- скорость подъёма частиц (доля высоты в секунду)
+    rise_speed = 0.05,
+    -- множитель зависимости скорости подъёма от уровня сигнала
+    level_rise_mult = 0.3,
     -- всплески отключены, используется отдельная bounce‑система
     burst_rate = 0,
     burst_speed = 0,
@@ -174,15 +182,17 @@ local function init_fog_system(track_index, meter_x, meter_y, meter_width, meter
     -- Инициализируем туман только один раз на трек
     if not fog_systems[track_index] then
         local fog_particles = {}
-        for i = 1, FOG_CONFIG.num_fog_particles do
-            -- Горизонтальная позиция случайная по ширине метра
-            local px = meter_x + math.random() * meter_width
-            -- Относительная базовая высота: распределение ^1.5 смещает большую часть к основанию
-            local rel = math.random() ^ 1.5 -- 0 (низ) ... 1 (верх)
-            local base_y = meter_y + rel * meter_height
-            local phase = math.random() * 2 * math.pi
-            -- Сохраняем относительную высоту и фазу. Координата y будет вычисляться при обновлении.
-            table.insert(fog_particles, {x = px, base_x = px, relative_y = rel, base_y = base_y, phase = phase, y = base_y})
+        local size = FOG_CONFIG.particle_size or 4
+        local cols = math.ceil(meter_width / size)
+        local rows = math.ceil(meter_height / size)
+        for row = 0, rows - 1 do
+            -- relative_y: 0 = верх, 1 = низ (как используется при вычислении позиции)
+            local rel = 1 - (row / math.max(1, rows - 1))
+            for col = 0, cols - 1 do
+                local px = meter_x + col * size + size / 2
+                local phase = math.random() * 2 * math.pi
+                table.insert(fog_particles, {x = px, base_x = px, relative_y = rel, phase = phase})
+            end
         end
         fog_systems[track_index] = {fog = fog_particles, bursts = {}}
     end
@@ -205,20 +215,27 @@ local function update_fog_system(track_index, audio_level, dt, meter_x, meter_y,
     local time = reaper.time_precise() or 0
     -- Update fog particles
     for _, p in ipairs(sys.fog) do
-        -- Vertical offset creates gentle motion that scales with audio level
+        -- Обновляем относительную высоту, создавая эффект подъёма дыма
+        local rise = (FOG_CONFIG.rise_speed + (audio_level or 0) * FOG_CONFIG.level_rise_mult) * dt
+        p.relative_y = p.relative_y - rise
+        -- Когда частица достигает верхней границы, переносим её в основание столбца
+        while p.relative_y < 0 do
+            p.relative_y = p.relative_y + 1
+            p.base_x = meter_x + math.random() * meter_width
+            p.phase = math.random() * 2 * math.pi
+        end
+        -- Вертикальное колыхание, зависящее от уровня сигнала
         local vert_amp = (audio_level or 0) * FOG_CONFIG.vertical_wave_amp
         local vertical_offset = math.sin(time * FOG_CONFIG.wave_speed * 2 + p.phase) * vert_amp
-        -- Map the particle's relative position into the allowed region
+        -- Пересчитываем абсолютные координаты
         p.y = region_top + (p.relative_y or 0) * region_height + vertical_offset
-        -- Horizontal sine movement
         p.x = p.base_x + math.sin(time * FOG_CONFIG.wave_speed + p.phase) * FOG_CONFIG.wave_amplitude
-        -- Clamp horizontally within the meter (taking into account a small radius for squares)
-        local radius = 3
+        -- Ограничиваем частицы границами столбца
+        local radius = (FOG_CONFIG.particle_size or 4) / 2
         if p.x < meter_x + radius then p.x = meter_x + radius end
         if p.x > meter_x + meter_width - radius then p.x = meter_x + meter_width - radius end
-        -- Clamp vertically within the region (including below the bar)
         if p.y > region_bottom - radius then p.y = region_bottom - radius end
-        if p.y < region_top + radius then p.y = region_top + radius end
+        if p.y < region_top then p.y = region_top end
     end
     -- Update bursts (disabled by configuration)
     for i = #sys.bursts, 1, -1 do
@@ -258,8 +275,8 @@ local function draw_fog_system(ctx, x, y, track_index, meter_width, meter_height
         end
         -- Интенсивность зависит от общего уровня сигнала и может слегка уменьшаться кверху
         local intensity = level
-        -- Рисуем квадрат со стороной 4 пикселя
-        local size = 4
+        -- Рисуем квадрат со стороной, определяемой конфигурацией
+        local size = FOG_CONFIG.particle_size or 4
         draw_lcd_pixel(dl, p.x - size/2, p.y - size/2, size, size, intensity, freq_factor)
     end
     -- Рисуем всплески (если включены) как LCD‑пиксели

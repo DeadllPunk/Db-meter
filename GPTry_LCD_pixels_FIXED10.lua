@@ -1,14 +1,5 @@
 -- FL Mixer Table Select - финальный вариант с подсветкой и линиями сендов
 
--- Инициализация таблицы для FL-style частиц
-fx_particles = {}
-
--- Переменная для управления видимостью панели настроек частиц
-show_particle_settings = false
-
--- Глобальный контекст для панели настроек частиц
-particle_ctx = nil
-
 -- Настраиваемый цвет темы для смешивания с цветами треков
 local THEME_COLOR = 0x1ED4E6FF  -- FL Studio голубой цвет (можно изменить на любой другой)
 
@@ -96,6 +87,15 @@ local function adjust_color_brightness(color, factor)
     end
 end
 
+-- Простая функция создания цвета в формате RGBA из компонентов 0-1
+local function ImColor(r, g, b, a)
+    r = math.floor(math.max(0, math.min(1, r)) * 255 + 0.5)
+    g = math.floor(math.max(0, math.min(1, g)) * 255 + 0.5)
+    b = math.floor(math.max(0, math.min(1, b)) * 255 + 0.5)
+    a = math.floor(math.max(0, math.min(1, a or 1)) * 255 + 0.5)
+    return (r << 24) | (g << 16) | (b << 8) | a
+end
+
 -- Функция отрисовки цветной полоски трека
 local function draw_track_color_strip(ctx, x, y, width, height, track_index)
     local track_color = get_enhanced_track_color(track_index)
@@ -124,657 +124,34 @@ local function draw_track_color_strip(ctx, x, y, width, height, track_index)
     reaper.ImGui_DrawList_AddRect(draw_list, x, y, x + width, y + height, 0x404040FF, 0, 0, 1)
 end
 
--- ========== ПИКСЕЛЬНАЯ СИСТЕМА ДЛЯ СПЕКТРАЛЬНОГО МЕТРА ==========
+-- ========== СИСТЕМА АНИМИРОВАННЫХ ЧАСТИЦ ДЛЯ СПЕКТРАЛЬНОГО МЕТРА ==========
 
--- Глобальные переменные для пиксельной системы
-local pixel_systems = {} -- Пиксельные системы для каждого трека
+-- Глобальные переменные для системы частиц
+local particle_systems = {} -- Системы частиц для каждого трека
 local last_update_times = {} -- Отдельное время обновления для каждого трека
--- Advanced spectrum animation variables (based on JSFX techniques)
-local spectrum_column_levels = {} -- Хранение предыдущих уровней столбцов спектра для плавной интерполяции
-local spectrum_integration_buffer = {} -- Буфер интеграции для сглаживания (как в JSFX)
-local spectrum_peak_hold = {} -- Удержание пиков
-local spectrum_fall_rate = {} -- Адаптивная скорость падения
-local integration_time = 150  -- ms, время интеграции как в JSFX
-local peak_hold_time = 500   -- ms для удержания пиков
-local last_spectrum_time = 0 -- Время последнего обновления спектра
 
--- Таблица для хранения смещений уровня ("пуша") от столкновений частиц с планкой.
--- Используем глобальную переменную, чтобы её можно было читать/записывать в разных частях скрипта.
-pixel_push_offsets = pixel_push_offsets or {}
-
--- Таблица для хранения позиций слайдеров (handle_y) для каждого трека
-local handle_positions = {}
-
--- ================== ДОПОЛНИТЕЛЬНАЯ СИСТЕМА "ТУМАН И ВСПЛЕСКИ" ==================
-
--- Конфигурация для тумана и всплесков
--- Настройки для тумана. Увеличили количество частиц и
--- уменьшили скорости для плавного «дымового» эффекта. Всплески
--- отключены, т.к. роль вспрыгивающих пикселей выполняет
--- отдельная bounce‑система.
-local FOG_CONFIG = {
-    -- размер частицы в пикселях (также используется для расчёта сетки)
-    particle_size = 4,
-    -- скорость горизонтальной волны
-    wave_speed = 0.2,
-    wave_amplitude = 3.0,
-    -- амплитуда вертикального смещения, усиливается уровнем аудио
-    vertical_wave_amp = 10.0,
-    -- базовая прозрачность частиц
-    fog_alpha = 0.35,
-    -- скорость подъёма частиц (доля высоты в секунду)
-    rise_speed = 0.05,
-    -- множитель зависимости скорости подъёма от уровня сигнала
-    level_rise_mult = 0.3,
-    -- всплески отключены, используется отдельная bounce‑система
-    burst_rate = 0,
-    burst_speed = 0,
-    burst_gravity = 0,
-    burst_fade = 0,
-    burst_size = 3,
-}
-
--- Системы тумана и всплесков для каждого трека
-local fog_systems = {}
-
--- Инициализация системы тумана для трека
-local function init_fog_system(track_index, meter_x, meter_y, meter_width, meter_height)
-    -- Инициализируем туман только один раз на трек
-    if not fog_systems[track_index] then
-        local fog_particles = {}
-        local size = FOG_CONFIG.particle_size or 4
-        local cols = math.ceil(meter_width / size)
-        local rows = math.ceil(meter_height / size)
-        for row = 0, rows - 1 do
-            -- Располагаем частицы по сетке от низа к верху, используя абсолютные координаты
-            local py = meter_y + meter_height - row * size - size / 2
-            for col = 0, cols - 1 do
-                local px = meter_x + col * size + size / 2
-                local phase = math.random() * 2 * math.pi
-                table.insert(fog_particles, {x = px, base_x = px, y = py, phase = phase})
-            end
-        end
-        fog_systems[track_index] = {fog = fog_particles, bursts = {}}
-    end
-end
-
--- Обновление системы тумана и всплесков
-local function update_fog_system(track_index, audio_level, dt, meter_x, meter_y, meter_width, meter_height, bar_y)
-    -- Ensure the fog system is initialized
-    init_fog_system(track_index, meter_x, meter_y, meter_width, meter_height)
-    local sys = fog_systems[track_index]
-    if not sys then return end
-    -- Сохраняем уровень для использования при отрисовке
-    sys.level = audio_level or 0
-    local region_top = meter_y
-    local region_bottom = meter_y + meter_height
-    local region_height = meter_height
-    local time = reaper.time_precise() or 0
-    -- Обновляем частицы тумана
-    for _, p in ipairs(sys.fog) do
-        -- Постоянное плавное "всплытие" вверх
-        local rise = (FOG_CONFIG.rise_speed + (audio_level or 0) * FOG_CONFIG.level_rise_mult) * meter_height * dt
-        p.y = p.y - rise
-        -- Возвращаем частицу в низ, если она ушла выше верхней границы
-        while p.y < region_top do
-            p.y = p.y + meter_height
-            p.base_x = meter_x + math.random() * meter_width
-            p.phase = math.random() * 2 * math.pi
-        end
-        -- Колыхание от сигнала
-        local vert_amp = (audio_level or 0) * FOG_CONFIG.vertical_wave_amp
-        local vertical_offset = math.sin(time * FOG_CONFIG.wave_speed * 2 + p.phase) * vert_amp
-        local final_y = p.y + vertical_offset
-        p.x = p.base_x + math.sin(time * FOG_CONFIG.wave_speed + p.phase) * FOG_CONFIG.wave_amplitude
-        -- Ограничиваем частицу рамками и планкой, не растягивая массив
-        local radius = (FOG_CONFIG.particle_size or 4) / 2
-        if bar_y and final_y < bar_y + radius then final_y = bar_y + radius end
-        if final_y > region_bottom - radius then final_y = region_bottom - radius end
-        if p.x < meter_x + radius then p.x = meter_x + radius end
-        if p.x > meter_x + meter_width - radius then p.x = meter_x + meter_width - radius end
-        p.y = final_y
-    end
-    -- Update bursts (disabled by configuration)
-    for i = #sys.bursts, 1, -1 do
-        local b = sys.bursts[i]
-        b.vy = b.vy + FOG_CONFIG.burst_gravity * dt
-        b.y = b.y + b.vy * dt
-        b.alpha = b.alpha - FOG_CONFIG.burst_fade * dt
-        if b.alpha <= 0 or b.y > meter_y + meter_height + 5 then
-            table.remove(sys.bursts, i)
-        end
-    end
-    -- Spawn bursts proportional to audio level (currently disabled)
-    local to_spawn = math.floor((audio_level or 0) * FOG_CONFIG.burst_rate * dt + 0.5)
-    for i = 1, to_spawn do
-        local bx = meter_x + math.random() * meter_width
-        local by = region_bottom - 5
-        local vy = -(audio_level * FOG_CONFIG.burst_speed + math.random() * 30)
-        local b = {x = bx, y = by, vy = vy, alpha = 1.0}
-        table.insert(sys.bursts, b)
-    end
-end
-
--- Отрисовка тумана и всплесков
-local function draw_fog_system(ctx, x, y, track_index, meter_width, meter_height)
-    local sys = fog_systems[track_index]
-    if not sys then return end
-    local dl = reaper.ImGui_GetWindowDrawList(ctx)
-    -- Определяем текущий уровень аудио для управления яркостью
-    local level = sys.level or 0
-    -- Рисуем дым мягкими кружками, создавая более «дымный» эффект
-    for _, p in ipairs(sys.fog) do
-        -- frequency_factor зависит от вертикальной позиции: нижние части синее, верхние более циан
-        local freq_factor = 0
-        if meter_height > 0 then
-            freq_factor = (p.y - y) / meter_height
-            freq_factor = math.max(0.0, math.min(1.0, freq_factor))
-        end
-        local size = FOG_CONFIG.particle_size or 4
-        local radius = size / 2
-        -- Прозрачность усиливается уровнем сигнала
-        local alpha = FOG_CONFIG.fog_alpha * (0.5 + 0.5 * level)
-        alpha = math.min(1.0, math.max(0.0, alpha))
-        local outer_alpha = math.floor(alpha * 255 * 0.5)
-        local inner_alpha = math.floor(alpha * 255)
-        -- Легкая вертикальная градация оттенка, чтобы туман не выглядел полностью плоским
-        local base = 180 + math.floor(20 * freq_factor)
-        local r, g, b = base, base, base
-        local outer_color = (r << 24) | (g << 16) | (b << 8) | outer_alpha
-        local inner_color = (r << 24) | (g << 16) | (b << 8) | inner_alpha
-        reaper.ImGui_DrawList_AddCircleFilled(dl, p.x, p.y, radius, outer_color)
-        reaper.ImGui_DrawList_AddCircleFilled(dl, p.x, p.y, radius * 0.6, inner_color)
-    end
-    -- Рисуем всплески (если включены) как LCD‑пиксели
-    for _, b in ipairs(sys.bursts) do
-        local size = FOG_CONFIG.burst_size
-        local intensity = math.max(0.0, math.min(1.0, b.alpha or 0))
-        local freq_factor = 0
-        if meter_height > 0 then
-            freq_factor = (b.y - y) / meter_height
-            freq_factor = math.max(0.0, math.min(1.0, freq_factor))
-        end
-        draw_lcd_pixel(dl, b.x - size / 2, b.y - size / 2, size, size, intensity, freq_factor)
-    end
-end
-
--- ================== СИСТЕМА "ВСПРЫГИВАЮЩИЕ И ПАДАЮЩИЕ ПИКСЕЛИ" ==================
-
--- Конфигурация для системы вспрыгивающих и падающих пикселей
--- Конфигурация для системы вспрыгивающих пикселей. Значения уменьшены
--- для более медленного и плавного движения. Размер частиц увеличен
--- для лучшей заметности.
-local BOUNCE_CONFIG = {
-    spawn_rate = 12,        -- количество новых частиц в секунду при audio_level=1 (увеличено для большей плотности)
-    init_speed = 150,       -- начальная скорость вверх (медленнее)
-    gravity = 200,          -- ускорение вниз (меньше для плавного падения)
-    fade = 0.6,             -- скорость затухания альфы (частицы живут дольше)
-    size = 5,               -- радиус частицы (чуть больше)
-    bounce_damping = 0.6    -- коэффициент затухания после отскока
-}
-
--- Системы вспрыгивающих частиц для каждого трека
-local bounce_systems = {}
-
--- Обновление системы вспрыгивающих и падающих пикселей
-local function update_bounce_system(track_index, audio_level, dt, bar_y, meter_x, meter_y, meter_width, meter_height)
-    -- Ensure a particle list exists for this track
-    if not bounce_systems[track_index] then
-        bounce_systems[track_index] = {}
-    end
-    local list = bounce_systems[track_index]
-
-    -- Determine how many new particles to spawn based on the current audio level
-    local to_spawn = math.floor((audio_level or 0) * BOUNCE_CONFIG.spawn_rate * dt + 0.5)
-    for i = 1, to_spawn do
-        -- Horizontal spawn position is random across the meter width
-        local px = meter_x + math.random() * meter_width
-        -- Spawn particles from the bottom of the meter so they travel up toward the bar
-        local radius = BOUNCE_CONFIG.size or 0
-        local spawn_y = meter_y + meter_height - radius - 1
-        -- Рассчитываем скорость так, чтобы частица гарантированно достигла планки
-        local distance = spawn_y - (bar_y or meter_y)
-        if distance < 0 then distance = 0 end
-        local min_speed = math.sqrt(2 * BOUNCE_CONFIG.gravity * distance)
-        -- Добавляем зависимость от уровня сигнала и небольшой разброс
-        local vy = -(min_speed + audio_level * BOUNCE_CONFIG.init_speed + math.random() * 20)
-        table.insert(list, {x = px, y = spawn_y, vy = vy, alpha = 1.0})
-    end
-
-    -- Track the maximum overshoot beyond the bar to push the level indicator
-    local max_push = 0
-    -- Update existing particles
-    for i = #list, 1, -1 do
-        local p = list[i]
-        -- Apply gravity
-        p.vy = p.vy + BOUNCE_CONFIG.gravity * dt
-        -- Update position
-        p.y = p.y + p.vy * dt
-        -- Fade out alpha over time
-        p.alpha = p.alpha - BOUNCE_CONFIG.fade * dt
-        -- Collision with the bar: particles should not move above the bar and will bounce off
-        if bar_y and p.y <= bar_y then
-            -- Calculate overshoot before clamping to compute push offset
-            local overshoot = bar_y - p.y
-            if overshoot > max_push then
-                max_push = overshoot
-            end
-            -- Clamp particle to the bar and invert its velocity for a bounce
-            p.y = bar_y
-            p.vy = -p.vy * BOUNCE_CONFIG.bounce_damping
-        end
-        -- Remove particles that fall below the meter or fade out completely
-        if p.y > meter_y + meter_height + 5 or p.alpha <= 0 then
-            table.remove(list, i)
-        end
-    end
-    return max_push
-end
-
--- Отрисовка вспрыгивающих и падающих пикселей
-local function draw_bounce_system(ctx, track_index, meter_x, meter_y, meter_width, meter_height)
-    local list = bounce_systems[track_index]
-    if not list then return end
-    local dl = reaper.ImGui_GetWindowDrawList(ctx)
-    for _, p in ipairs(list) do
-        -- Радиус круга определяется размером в конфигурации
-        local radius = BOUNCE_CONFIG.size
-        local intensity = math.max(0.0, math.min(1.0, p.alpha or 0))
-        -- Частотный коэффициент по вертикальной позиции: нижние части → низкие частоты, верхние → высокие
-        local freq_factor = 0
-        if meter_height > 0 then
-            freq_factor = (p.y - meter_y) / meter_height
-            freq_factor = math.max(0.0, math.min(1.0, freq_factor))
-        end
-        -- Выбираем базовый цвет в зависимости от freq_factor (аналогично draw_lcd_pixel)
-        local base_color
-        if freq_factor < 0.33 then
-            base_color = {r = 0, g = 180, b = 255}
-        elseif freq_factor < 0.66 then
-            local factor = (freq_factor - 0.33) / 0.33
-            base_color = {
-                r = 0 + (0 - 0) * factor,
-                g = 180 + (220 - 180) * factor,
-                b = 255 + (255 - 255) * factor
-            }
-        else
-            local factor = (freq_factor - 0.66) / 0.34
-            base_color = {
-                r = 0 + (80 - 0) * factor,
-                g = 220 + (255 - 220) * factor,
-                b = 255 + (255 - 255) * factor
-            }
-        end
-        -- Усиливаем яркость в зависимости от интенсивности
-        local brightness_boost = 1.5
-        local final_intensity = math.min(1.0, intensity * brightness_boost)
-        local r = math.floor(base_color.r * final_intensity)
-        local g = math.floor(base_color.g * final_intensity)
-        local b = math.floor(base_color.b * final_intensity)
-        local alpha = math.floor(255 * intensity)
-        -- Собираем цвет в формате RGBA (8 бит на канал)
-        local color = (r << 24) | (g << 16) | (b << 8) | alpha
-        -- Рисуем заполненный круг
-        reaper.ImGui_DrawList_AddCircleFilled(dl, p.x, p.y, radius, color)
-    end
-end
-
--- Advanced interpolation function (from JSFX techniques)
-function exponential_smooth(current, target, rate, dt)
-    local smooth_factor = math.exp(-rate * dt / 1000.0)
-    return current + (target - current) * (1 - smooth_factor)
-end
-
--- LCD Pixel rendering function with realistic LCD effect
-local function draw_lcd_pixel(draw_list, x, y, width, height, intensity, frequency_factor)
-    -- LCD цветовая схема как на скриншоте
-    local lcd_colors = {
-        -- Основные цвета для разных частот (cyan/blue тематика)
-        low = {r = 0, g = 180, b = 255},      -- Голубой для низких частот
-        mid = {r = 0, g = 220, b = 255},      -- Светло-голубой для средних
-        high = {r = 80, g = 255, b = 255},    -- Яркий cyan для высоких
-        background = {r = 5, g = 15, b = 25}, -- Темно-синий фон LCD
-        border = {r = 20, g = 40, b = 60}     -- Граница пикселя
-    }
-    
-    -- Выбираем цвет в зависимости от частоты
-    local base_color
-    if frequency_factor < 0.33 then
-        base_color = lcd_colors.low
-    elseif frequency_factor < 0.66 then
-        -- Интерполяция между low и mid
-        local factor = (frequency_factor - 0.33) / 0.33
-        base_color = {
-            r = lcd_colors.low.r + (lcd_colors.mid.r - lcd_colors.low.r) * factor,
-            g = lcd_colors.low.g + (lcd_colors.mid.g - lcd_colors.low.g) * factor,
-            b = lcd_colors.low.b + (lcd_colors.mid.b - lcd_colors.low.b) * factor
-        }
-    else
-        -- Интерполяция между mid и high
-        local factor = (frequency_factor - 0.66) / 0.34
-        base_color = {
-            r = lcd_colors.mid.r + (lcd_colors.high.r - lcd_colors.mid.r) * factor,
-            g = lcd_colors.mid.g + (lcd_colors.high.g - lcd_colors.mid.g) * factor,
-            b = lcd_colors.mid.b + (lcd_colors.high.b - lcd_colors.mid.b) * factor
-        }
-    end
-    
-    -- Рассчитываем финальную интенсивность (увеличена для большей яркости)
-    local final_intensity = math.max(0.2, intensity * 1.5) -- Увеличена минимальная видимость и общая яркость
-    final_intensity = math.min(1.0, final_intensity) -- Ограничиваем максимум
-    
-    -- Создаем LCD эффект с несколькими слоями
-    
-    -- 1. Фон пикселя (темный, но более заметный)
-    local bg_alpha = math.floor(120 * final_intensity) -- Увеличено с 80
-    local bg_color = (lcd_colors.background.r << 24) | (lcd_colors.background.g << 16) | 
-                     (lcd_colors.background.b << 8) | bg_alpha
-    reaper.ImGui_DrawList_AddRectFilled(draw_list, x, y, x + width, y + height, bg_color)
-    
-    -- 2. Граница пикселя (создает эффект сегментов LCD, ярче)
-    local border_alpha = math.floor(180 * final_intensity) -- Увеличено с 120
-    local border_color = (lcd_colors.border.r << 24) | (lcd_colors.border.g << 16) | 
-                         (lcd_colors.border.b << 8) | border_alpha
-    reaper.ImGui_DrawList_AddRect(draw_list, x, y, x + width, y + height, border_color, 0, 0, 1)
-    
-    -- 3. Основной светящийся пиксель (уменьшенный для создания эффекта сегмента)
-    local inner_margin = 1
-    local inner_x = x + inner_margin
-    local inner_y = y + inner_margin
-    local inner_width = width - inner_margin * 2
-    local inner_height = height - inner_margin * 2
-    
-    if inner_width > 0 and inner_height > 0 then
-        -- Основной цвет с увеличенной интенсивностью
-        local main_alpha = math.floor(255 * final_intensity)
-        local brightness_boost = 1.3 -- Увеличиваем яркость цветов
-        local main_color = (math.floor(base_color.r * final_intensity * brightness_boost) << 24) | 
-                          (math.floor(base_color.g * final_intensity * brightness_boost) << 16) | 
-                          (math.floor(base_color.b * final_intensity * brightness_boost) << 8) | main_alpha
-        
-        reaper.ImGui_DrawList_AddRectFilled(draw_list, inner_x, inner_y, 
-                                           inner_x + inner_width, inner_y + inner_height, main_color)
-        
-        -- 4. Эффект свечения для ярких пикселей (порог снижен для большего свечения)
-        if intensity > 0.5 then -- Снижено с 0.7
-            local glow_margin = -1
-            local glow_alpha = math.floor(120 * (intensity - 0.5) / 0.5) -- Увеличено с 80
-            local glow_color = (math.floor(base_color.r * 1.0) << 24) | -- Увеличено с 0.8
-                              (math.floor(base_color.g * 1.0) << 16) | 
-                              (math.floor(base_color.b * 1.0) << 8) | glow_alpha
-            
-            reaper.ImGui_DrawList_AddRectFilled(draw_list, 
-                                               x + glow_margin, y + glow_margin,
-                                               x + width - glow_margin, y + height - glow_margin, 
-                                               glow_color)
-        end
-        
-        -- 5. Дополнительный яркий центр для очень активных пикселей (порог снижен)
-        if intensity > 0.8 then -- Снижено с 0.9
-            local center_margin = 2
-            local center_x = x + center_margin
-            local center_y = y + center_margin
-            local center_width = width - center_margin * 2
-            local center_height = height - center_margin * 2
-            
-            if center_width > 0 and center_height > 0 then
-                local center_alpha = math.floor(255 * (intensity - 0.8) / 0.2) -- Увеличено с 200
-                local center_color = (255 << 24) | (255 << 16) | (255 << 8) | center_alpha -- Белый центр
-                
-                reaper.ImGui_DrawList_AddRectFilled(draw_list, center_x, center_y,
-                                                   center_x + center_width, center_y + center_height,
-                                                   center_color)
-            end
-        end
-    end
-end
-
--- Экспортируем функцию draw_lcd_pixel в глобальную область видимости, чтобы её можно было
--- вызывать из других модулей и из отложенных функций, где локальная область видимости
--- недоступна (например, в draw_fog_system).
-_G.draw_lcd_pixel = draw_lcd_pixel
-
--- Frequency-dependent slope compensation (like JSFX octave gain)
-function apply_frequency_slope(level, freq_index, total_bands, slope_db_per_octave)
-    if slope_db_per_octave == 0 then return level end
-    
-    local freq_ratio = freq_index / total_bands
-    local octaves = math.log(freq_ratio * 20000 / 20) / math.log(2)  -- Assuming 20Hz-20kHz range
-    local gain_db = octaves * slope_db_per_octave
-    local gain_linear = 10 ^ (gain_db / 20)
-    
-    return level * gain_linear
-end
-
--- Настройки пиксельной системы
-local PIXEL_CONFIG = {
-    pixel_size = 2,            -- Размер одного пикселя
+-- Настройки частиц
+local PARTICLE_CONFIG = {
+    max_particles = 100,       -- Увеличено с 80 до 100 для большей плотности
+    particle_size_min = 1.5,   -- Увеличено с 1 до 1.5 для лучшей видимости
+    particle_size_max = 5,     -- Увеличено с 4 до 5 для более ярких пиков
+    glow_layers = 4,           -- Увеличено с 3 до 4 для лучшего свечения
+    fade_speed = 0.94,         -- Увеличено с 0.92 для более медленного затухания
+    noise_amplitude = 3,       -- Увеличено с 2 до 3 для более живого движения
     meter_width = 25,          -- Ширина метра
     meter_height = 150,        -- Высота метра
-    rows = 30,                 -- Количество рядов пикселей
-    cols = 8,                  -- Количество колонок пикселей
-    update_rate = 120,         -- FPS для плавной анимации
-    max_particles = 100,       -- Максимальное количество частиц
-    glow_layers = 3,           -- Количество слоев свечения
-    
-    -- Физика пикселей
-    gravity = 80,              -- Гравитация для падения пикселей (уменьшена для более плавного движения)
-    bounce_damping = 0.7,      -- Затухание при отскоке
-    push_force = 120,          -- Сила толчка при сильном сигнале (уменьшена для более плавного движения)
-    settle_speed = 0.95,       -- Скорость успокоения пикселей
-    
-    -- Визуальные эффекты
-    glow_intensity = 0.8,      -- Интенсивность свечения активных пикселей
-    fade_speed = 0.98,         -- Скорость затухания неактивных пикселей
-    wave_speed = 1.5,          -- Скорость волнового эффекта (уменьшена для более плавного движения)
-    wave_amplitude = 3.0,      -- Амплитуда волнового движения (уменьшена)
-    
-    -- Дополнительные эффекты
-    enable_connections = false, -- Включить соединения между пикселями
-    connection_distance = 20,   -- Максимальное расстояние для соединений
-    max_connections = 3,        -- Максимальное количество соединений на пиксель
-    enable_sparks = false,      -- Включить искры
-    spark_threshold = 0.7,      -- Порог интенсивности для искр
-    enable_ellipses = false,    -- Включить эллипсы
-    ellipse_threshold = 0.5,    -- Порог интенсивности для эллипсов
+    update_rate = 120,         -- Увеличено с 60 до 120 FPS для более плавной анимации
 }
 
--- Цвета градиента для пикселей (cyan к blue)
-local PIXEL_COLORS = {
-    cyan = {r = 0, g = 255, b = 255},      -- Cyan для активных пикселей
-    blue = {r = 0, g = 100, b = 255},      -- Blue для средней активности
-    dark_blue = {r = 0, g = 50, b = 150},  -- Dark blue для неактивных пикселей
-    background = {r = 20, g = 20, b = 20}, -- Фон метра
+-- Цвета градиента (cyan к blue)
+local PARTICLE_COLORS = {
+    cyan = {r = 0, g = 255, b = 255},      -- Cyan
+    blue = {r = 0, g = 100, b = 255},      -- Blue
+    dark_blue = {r = 0, g = 50, b = 150},  -- Dark blue для затухания
 }
 
--- Функция инициализации пиксельной системы для трека
-local function init_pixel_system(track_index, meter_width, meter_height)
-    if not pixel_systems[track_index] then
-        local system = {
-            pixels = {},  -- Одномерный массив пикселей
-            meter_width = meter_width or PIXEL_CONFIG.meter_width,
-            meter_height = meter_height or PIXEL_CONFIG.meter_height,
-            current_level = 0,
-            peak_level = 0,
-            peak_hold_time = 0,
-        }
-        
-        -- Создаем начальные пиксели для визуализации
-        local rows = PIXEL_CONFIG.rows
-        local cols = PIXEL_CONFIG.cols
-        local pixel_width = system.meter_width / cols
-        local pixel_height = system.meter_height / rows
-        
-        for row = 1, rows do
-            for col = 1, cols do
-                local pixel_x = (col - 1) * pixel_width + pixel_width / 2
-                local pixel_y = (row - 1) * pixel_height + pixel_height / 2
-                
-                local pixel = {
-                    x = pixel_x,
-                    y = pixel_y,
-                    base_x = pixel_x,
-                    base_y = pixel_y,
-                    velocity_x = 0,
-                    velocity_y = 0,
-                    intensity = 0,
-                    active = false,
-                    bounce_energy = 0,
-                    settle_timer = 0,
-                    row = row,
-                    col = col,
-                    alpha = 1.0,
-                    life = 1.0,
-                    gravity = PIXEL_CONFIG.gravity
-                }
-                
-                table.insert(system.pixels, pixel)
-            end
-        end
-        
-        pixel_systems[track_index] = system
-    end
-    
-    return pixel_systems[track_index]
-end
-
--- Функция создания пикселя (заменяет create_particle)
-local function create_pixel(row, col, intensity, audio_level)
-    return {
-        row = row,
-        col = col,
-        intensity = intensity or 0,
-        active = true,
-        bounce_energy = (intensity or 0) * PIXEL_CONFIG.push_force,
-        settle_timer = 0,
-    }
-end
-
--- Функция получения цвета пикселя
-local function get_pixel_color(intensity, alpha)
-    local cyan = PIXEL_COLORS.cyan
-    local blue = PIXEL_COLORS.blue
-    local dark_blue = PIXEL_COLORS.dark_blue
-    local background = PIXEL_COLORS.background
-    
-    local r, g, b
-    if intensity > 0.7 then
-        -- Высокая интенсивность: cyan
-        local factor = (intensity - 0.7) / 0.3
-        r = cyan.r
-        g = cyan.g
-        b = cyan.b
-    elseif intensity > 0.3 then
-        -- Средняя интенсивность: blue к cyan
-        local factor = (intensity - 0.3) / 0.4
-        r = blue.r + (cyan.r - blue.r) * factor
-        g = blue.g + (cyan.g - blue.g) * factor
-        b = blue.b + (cyan.b - blue.b) * factor
-    elseif intensity > 0.05 then
-        -- Низкая интенсивность: dark_blue к blue
-        local factor = (intensity - 0.05) / 0.25
-        r = dark_blue.r + (blue.r - dark_blue.r) * factor
-        g = dark_blue.g + (blue.g - dark_blue.g) * factor
-        b = dark_blue.b + (blue.b - dark_blue.b) * factor
-    else
-        -- Неактивный: фон
-        r = background.r
-        g = background.g
-        b = background.b
-    end
-    
-    -- Применяем альфа-канал
-    local final_alpha = math.floor(alpha * 255)
-    return (math.floor(r) << 24) | (math.floor(g) << 16) | (math.floor(b) << 8) | final_alpha
-end
-
--- Функция обновления пиксельной системы (заменяет UpdateFXParticlesFL)
-function UpdatePixelSystemFL(track_index, level, meter_x, meter_y, meter_width, meter_height)
-    -- Инициализируем систему если её нет
-    local system = init_pixel_system(track_index, meter_width, meter_height)
-    
-    local current_time = reaper.time_precise()
-    local delta_time = 1.0 / PIXEL_CONFIG.update_rate
-    
-    -- Преобразуем уровень в дБ
-    local level_db = 20 * (math.log(math.max(0.00001, level)) / math.log(10))
-    level_db = math.max(-60, math.min(12, level_db))
-    local db_normalized = (level_db + 60) / 72  -- -60..+12 дБ -> 0..1
-    
-    -- Обновляем текущий уровень системы
-    system.current_level = db_normalized
-    
-    -- Обновляем пик с удержанием
-    if db_normalized > system.peak_level then
-        system.peak_level = db_normalized
-        system.peak_hold_time = current_time + 1.0  -- Удерживаем пик 1 секунду
-    elseif current_time > system.peak_hold_time then
-        system.peak_level = system.peak_level * 0.99  -- Медленное падение пика
-    end
-    
-    -- Обновляем каждый пиксель в одномерном массиве
-    for i, pixel in ipairs(system.pixels) do
-        -- Инициализируем поля пикселя если они nil
-        pixel.intensity = pixel.intensity or 0
-        pixel.bounce_energy = pixel.bounce_energy or 0
-        pixel.velocity_x = pixel.velocity_x or 0
-        pixel.velocity_y = pixel.velocity_y or 0
-        pixel.base_x = pixel.base_x or pixel.x
-        pixel.base_y = pixel.base_y or pixel.y
-        
-        -- Обновляем интенсивность с затуханием
-        pixel.intensity = pixel.intensity * PIXEL_CONFIG.fade_speed
-        
-        -- Усиливаем интенсивность и энергию отскока на основе аудио уровня и позиции пикселя
-        local pixel_y_normalized = (pixel.y - meter_y) / meter_height
-        local distance_from_bottom = 1.0 - pixel_y_normalized
-        
-        if db_normalized > distance_from_bottom * 0.8 then
-            pixel.intensity = math.min(1.0, pixel.intensity + db_normalized * delta_time * 3)
-            pixel.bounce_energy = pixel.bounce_energy + db_normalized * PIXEL_CONFIG.push_force * delta_time
-        end
-        
-        -- Применяем физику
-        -- Гравитация
-        pixel.velocity_y = pixel.velocity_y + PIXEL_CONFIG.gravity * delta_time
-        
-        -- Горизонтальное волновое движение
-        local wave_phase = current_time * PIXEL_CONFIG.wave_speed + pixel.x * 0.01
-        pixel.velocity_x = pixel.velocity_x + math.sin(wave_phase) * db_normalized * 10 * delta_time
-        
-        -- Обновляем позицию
-        pixel.x = pixel.x + pixel.velocity_x * delta_time
-        pixel.y = pixel.y + pixel.velocity_y * delta_time
-        
-        -- Применяем границы метра
-        if pixel.x < meter_x then
-            pixel.x = meter_x
-            pixel.velocity_x = pixel.velocity_x * -PIXEL_CONFIG.bounce_damping
-        elseif pixel.x > meter_x + meter_width then
-            pixel.x = meter_x + meter_width
-            pixel.velocity_x = pixel.velocity_x * -PIXEL_CONFIG.bounce_damping
-        end
-        
-        if pixel.y < meter_y then
-            pixel.y = meter_y
-            pixel.velocity_y = pixel.velocity_y * -PIXEL_CONFIG.bounce_damping
-        elseif pixel.y > meter_y + meter_height then
-            pixel.y = meter_y + meter_height
-            pixel.velocity_y = pixel.velocity_y * -PIXEL_CONFIG.bounce_damping
-            pixel.bounce_energy = 0  -- Сбрасываем энергию отскока при достижении дна
-        end
-        
-        -- Применяем демпфирование
-        pixel.velocity_x = pixel.velocity_x * PIXEL_CONFIG.bounce_damping
-        pixel.velocity_y = pixel.velocity_y * PIXEL_CONFIG.bounce_damping
-        pixel.bounce_energy = pixel.bounce_energy * PIXEL_CONFIG.settle_speed
-    end
-    
-    return 0
-end
-
--- Функция создания нового пикселя с жесткими границами метра
-local function create_pixel(x, y, intensity, audio_level, meter_width, meter_x, meter_y, meter_height)
+-- Функция создания новой частицы
+local function create_particle(x, y, intensity, audio_level)
     -- audio_level приходит как линейное значение амплитуды от Track_GetPeakInfo
     -- Преобразуем в дБ как в Reaper: dB = 20 * log10(amplitude)
     local level_db = 20 * (math.log(math.max(0.00001, audio_level)) / math.log(10))
@@ -787,63 +164,27 @@ local function create_pixel(x, y, intensity, audio_level, meter_width, meter_x, 
     -- Нормализуем дБ в диапазон 0-1 для расчета скорости
     local db_normalized = (level_db + 60) / 72  -- -60..+12 дБ -> 0..1
     
-    -- Устанавливаем жесткие границы метра
-    local safe_meter_width = meter_width or PIXEL_CONFIG.meter_width
-    local safe_meter_x = meter_x or 0
-    local safe_meter_y = meter_y or 0
-    local safe_meter_height = meter_height or PIXEL_CONFIG.meter_height
-    
-    -- Жестко ограничиваем координаты внутри метра с отступом
-    local margin = 3
-    local min_x = safe_meter_x + margin
-    local max_x = safe_meter_x + safe_meter_width - margin
-    local min_y = safe_meter_y + margin
-    local max_y = safe_meter_y + safe_meter_height - margin
-    
-    -- Принудительно помещаем пиксель внутри границ
-    local clamped_x = math.max(min_x, math.min(max_x, x))
-    local clamped_y = math.max(min_y, math.min(max_y, y))
-    
     return {
-        x = clamped_x,
-        y = clamped_y,
-        base_x = clamped_x,                      -- Базовая позиция для "живого" движения
-        base_y = clamped_y,
-        -- Сохраняем границы метра для жесткого ограничения движения
-        meter_x = safe_meter_x,
-        meter_y = safe_meter_y,
-        meter_width = safe_meter_width,
-        meter_height = safe_meter_height,
-        min_x = min_x,
-        max_x = max_x,
-        min_y = min_y,
-        max_y = max_y,
+        x = x + (math.random() - 0.5) * 8,  -- Случайное смещение по X
+        y = y,
+        base_x = x,                          -- Базовая позиция для "живого" движения
+        base_y = y,
         velocity_y = -30 - (db_normalized * 80), -- Скорость подъема зависит от дБ уровня
-        velocity_x = (math.random() - 0.5) * 20, -- Горизонтальная скорость для отскоков
-        size = PIXEL_CONFIG.pixel_size + ((intensity or 0) * PIXEL_CONFIG.pixel_size),
-        intensity = intensity or 0,
-        bounce_energy = db_normalized * PIXEL_CONFIG.push_force,
-        color = {r = 0, g = 0, b = 0}, -- Цвет будет установлен при отрисовке
-        row = math.floor((clamped_y - safe_meter_y) / PIXEL_CONFIG.pixel_size),
-        column = math.floor((clamped_x - safe_meter_x) / PIXEL_CONFIG.pixel_size),
-        -- время жизни частицы и альфа/гравитация по умолчанию для UpdateFXParticlesFL
-        life = 1.0,
-        alpha = 1.0,
-        gravity = PIXEL_CONFIG.gravity
+        size = PARTICLE_CONFIG.particle_size_min + 
+               (PARTICLE_CONFIG.particle_size_max - PARTICLE_CONFIG.particle_size_min) * intensity,
+        alpha = intensity,
+        life = 1.0,                         -- Время жизни частицы
+        noise_offset = math.random() * math.pi * 2, -- Смещение для шума
+        intensity = intensity,
+        gravity = 20 + (db_normalized * 30), -- Гравитация тоже зависит от дБ уровня
     }
 end
 
--- Сохраняем для обратной совместимости
-local function create_particle(x, y, intensity, audio_level, meter_width, meter_x, meter_y, meter_height)
-    return create_pixel(x, y, intensity, audio_level, meter_width, meter_x, meter_y, meter_height)
-end
-
 -- Функция получения цвета частицы с градиентом
--- Функция получения цвета пикселя в зависимости от интенсивности и прозрачности
-local function get_pixel_color(intensity, alpha)
-    local cyan = PIXEL_COLORS.cyan
-    local blue = PIXEL_COLORS.blue
-    local dark_blue = PIXEL_COLORS.dark_blue
+local function get_particle_color(intensity, alpha)
+    local cyan = PARTICLE_COLORS.cyan
+    local blue = PARTICLE_COLORS.blue
+    local dark_blue = PARTICLE_COLORS.dark_blue
     
     -- Интерполяция между cyan и blue в зависимости от интенсивности
     local r, g, b
@@ -866,444 +207,93 @@ local function get_pixel_color(intensity, alpha)
     return (math.floor(r) << 24) | (math.floor(g) << 16) | (math.floor(b) << 8) | final_alpha
 end
 
--- Функция получения цвета частицы (для обратной совместимости)
-local function get_particle_color(intensity, alpha)
-    -- Перенаправляем на новую функцию
-    return get_pixel_color(intensity, alpha)
-end
-
--- Функция для создания градиентных пикселей
-local function get_pixel_gradient_colors(intensity, alpha)
-    local colors = {}
-    local base_color = get_pixel_color(intensity, alpha)
-    
-    -- Создаем градиент от центра к краям
-    colors.center = base_color
-    colors.edge = get_pixel_color(intensity * 0.3, alpha * 0.1)
-    
-    return colors
-end
-
--- Функция для создания градиентных частиц (для обратной совместимости)
-local function get_particle_gradient_colors(intensity, alpha)
-    -- Перенаправляем на новую функцию
-    return get_pixel_gradient_colors(intensity, alpha)
-end
-
--- Функция для отрисовки связей между пикселями
-local function draw_pixel_connections(draw_list, pixels)
-    if not PIXEL_CONFIG.enable_connections then return end
-    
-    local connection_distance = PIXEL_CONFIG.connection_distance
-    local max_connections = PIXEL_CONFIG.max_connections
-    
-    for i, pixel1 in ipairs(pixels) do
-        local connections_made = 0
-        
-        for j = i + 1, #pixels do
-            if connections_made >= max_connections then break end
-            
-            local pixel2 = pixels[j]
-            local dx = pixel2.x - pixel1.x
-            local dy = pixel2.y - pixel1.y
-            local distance = math.sqrt(dx * dx + dy * dy)
-            
-            if distance < connection_distance and distance > 5 then
-                -- Вычисляем альфа-канал связи на основе расстояния и интенсивности пикселей
-                local connection_alpha = (1 - distance / connection_distance) * 
-                                       (pixel1.alpha + pixel2.alpha) * 0.25
-                
-                if connection_alpha > 0.05 then
-                    -- Создаем контрольные точки для Bezier-кривой
-                    local mid_x = (pixel1.x + pixel2.x) * 0.5
-                    local mid_y = (pixel1.y + pixel2.y) * 0.5
-                    local curve_offset = math.sin(reaper.time_precise() * 2 + i + j) * 10
-                    
-                    local ctrl1_x = pixel1.x + dx * 0.3
-                    local ctrl1_y = pixel1.y + dy * 0.3 + curve_offset
-                    local ctrl2_x = pixel2.x - dx * 0.3
-                    local ctrl2_y = pixel2.y - dy * 0.3 - curve_offset
-                    
-                    -- Цвет связи - смесь цветов пикселей
-                    local avg_intensity = (pixel1.intensity + pixel2.intensity) * 0.5
-                    local connection_color = get_pixel_color(avg_intensity, connection_alpha)
-                    
-                    -- Рисуем Bezier-кривую
-                    reaper.ImGui_DrawList_AddBezierCubic(draw_list,
-                        pixel1.x, pixel1.y,
-                        ctrl1_x, ctrl1_y,
-                        ctrl2_x, ctrl2_y,
-                        pixel2.x, pixel2.y,
-                        connection_color, 1.0, 0)
-                    
-                    connections_made = connections_made + 1
-                end
-            end
-        end
-    end
-end
-
--- Функция для отрисовки связей между частицами (для обратной совместимости)
-local function draw_particle_connections(draw_list, particles)
-    -- Перенаправляем на новую функцию
-    draw_pixel_connections(draw_list, particles)
-end
-
--- Функция для отрисовки пульсирующих колец вокруг ярких пикселей
-local function draw_pixel_rings(draw_list, x, y, pixel)
-    if not PIXEL_CONFIG.enable_sparks or (pixel.intensity or 0) < PIXEL_CONFIG.spark_threshold then
-        return
+-- Функция обновления системы частиц для трека
+local function update_particle_system(track_index, audio_level, delta_time, meter_height)
+    if not particle_systems[track_index] then
+        particle_systems[track_index] = {particles = {}}
     end
     
-    local time = reaper.time_precise()
-    local ring_count = 2
-    
-    for i = 1, ring_count do
-        local ring_phase = (time * 2 + (pixel.noise_offset or 0) + i * 0.5) % (math.pi * 2)
-        local ring_radius = (pixel.size or 1) * (2 + i * 0.5) + math.sin(ring_phase) * (pixel.size or 1) * 0.3
-        local ring_alpha = (pixel.alpha or 1.0) * 0.3 * (1 - i * 0.3) * (0.5 + 0.5 * math.sin(ring_phase))
-        
-        if ring_alpha > 0.05 then
-            local ring_color = get_pixel_color((pixel.intensity or 0) * 0.6, ring_alpha)
-            reaper.ImGui_DrawList_AddCircle(draw_list, x, y, ring_radius, ring_color, 0, 1.5)
-        end
-    end
-end
-
--- Функция для отрисовки пульсирующих колец вокруг ярких частиц (для обратной совместимости)
-local function draw_particle_rings(draw_list, x, y, particle)
-    -- Перенаправляем на новую функцию
-    draw_pixel_rings(draw_list, x, y, particle)
-end
-
--- Функция для отображения панели настроек частиц
-function draw_particle_settings_panel()
-    if not show_particle_settings then 
-        return 
-    end
-    
-    -- Create context only once
-    if not particle_ctx then
-        particle_ctx = reaper.ImGui_CreateContext('Particle Settings')
-        if not particle_ctx then
-            return
-        end
-    end
-    
-    local flags = reaper.ImGui_WindowFlags_AlwaysAutoResize()
-    local visible, open = reaper.ImGui_Begin(particle_ctx, "Particle Effects Settings", true, flags)
-    
-    if visible then
-        -- Основные настройки
-        if reaper.ImGui_CollapsingHeader(particle_ctx, "Basic Settings", reaper.ImGui_TreeNodeFlags_DefaultOpen()) then
-            local changed, new_val
-            
-            changed, new_val = reaper.ImGui_SliderInt(particle_ctx, "Max Particles", PARTICLE_CONFIG.max_particles, 50, 500)
-            if changed then PARTICLE_CONFIG.max_particles = new_val end
-            
-            changed, new_val = reaper.ImGui_SliderDouble(particle_ctx, "Min Size", PARTICLE_CONFIG.particle_size_min, 1.0, 10.0, "%.1f")
-            if changed then PARTICLE_CONFIG.particle_size_min = new_val end
-            
-            changed, new_val = reaper.ImGui_SliderDouble(particle_ctx, "Max Size", PARTICLE_CONFIG.particle_size_max, 5.0, 20.0, "%.1f")
-            if changed then PARTICLE_CONFIG.particle_size_max = new_val end
-            
-            changed, new_val = reaper.ImGui_SliderInt(particle_ctx, "Glow Layers", PARTICLE_CONFIG.glow_layers, 1, 10)
-            if changed then PARTICLE_CONFIG.glow_layers = new_val end
-            
-            changed, new_val = reaper.ImGui_SliderDouble(particle_ctx, "Fade Speed", PARTICLE_CONFIG.fade_speed, 0.90, 0.99, "%.3f")
-            if changed then PARTICLE_CONFIG.fade_speed = new_val end
-        end
-        
-        -- Настройки эффектов
-        if reaper.ImGui_CollapsingHeader(particle_ctx, "Effect Settings", reaper.ImGui_TreeNodeFlags_DefaultOpen()) then
-            local changed, new_val
-            
-            changed, new_val = reaper.ImGui_Checkbox(particle_ctx, "Enable Ellipses", PARTICLE_CONFIG.enable_ellipses)
-            if changed then PARTICLE_CONFIG.enable_ellipses = new_val end
-            
-            if PARTICLE_CONFIG.enable_ellipses then
-                changed, new_val = reaper.ImGui_SliderDouble(particle_ctx, "Ellipse Threshold", PARTICLE_CONFIG.ellipse_threshold, 0.1, 1.0, "%.2f")
-                if changed then PARTICLE_CONFIG.ellipse_threshold = new_val end
-            end
-            
-            changed, new_val = reaper.ImGui_Checkbox(particle_ctx, "Enable Sparks", PARTICLE_CONFIG.enable_sparks)
-            if changed then PARTICLE_CONFIG.enable_sparks = new_val end
-            
-            if PARTICLE_CONFIG.enable_sparks then
-                changed, new_val = reaper.ImGui_SliderDouble(particle_ctx, "Spark Threshold", PARTICLE_CONFIG.spark_threshold, 0.1, 1.0, "%.2f")
-                if changed then PARTICLE_CONFIG.spark_threshold = new_val end
-            end
-            
-            changed, new_val = reaper.ImGui_Checkbox(particle_ctx, "Enable Connections", PARTICLE_CONFIG.enable_connections)
-            if changed then PARTICLE_CONFIG.enable_connections = new_val end
-            
-            if PARTICLE_CONFIG.enable_connections then
-                changed, new_val = reaper.ImGui_SliderDouble(particle_ctx, "Connection Distance", PARTICLE_CONFIG.connection_distance, 20.0, 200.0, "%.0f")
-                if changed then PARTICLE_CONFIG.connection_distance = new_val end
-                
-                changed, new_val = reaper.ImGui_SliderInt(particle_ctx, "Max Connections", PARTICLE_CONFIG.max_connections, 1, 10)
-                if changed then PARTICLE_CONFIG.max_connections = new_val end
-            end
-        end
-        
-        -- Кнопки сброса
-        reaper.ImGui_Separator(particle_ctx)
-        if reaper.ImGui_Button(particle_ctx, "Reset to Defaults") then
-            PARTICLE_CONFIG.max_particles = 100
-            PARTICLE_CONFIG.particle_size_min = 3
-            PARTICLE_CONFIG.particle_size_max = 8
-            PARTICLE_CONFIG.glow_layers = 4
-            PARTICLE_CONFIG.fade_speed = 0.97
-            PARTICLE_CONFIG.noise_amplitude = 3
-            PARTICLE_CONFIG.enable_ellipses = true
-            PARTICLE_CONFIG.enable_sparks = true
-            PARTICLE_CONFIG.enable_connections = true
-            PARTICLE_CONFIG.spark_threshold = 0.8
-            PARTICLE_CONFIG.ellipse_threshold = 0.7
-            PARTICLE_CONFIG.connection_distance = 50
-            PARTICLE_CONFIG.max_connections = 3
-        end
-        
-        reaper.ImGui_End(particle_ctx)
-    end
-    
-    if not open then
-        show_particle_settings = false
-    end
-end
-
--- Функция для отрисовки улучшенной частицы с градиентом
--- Функция для отрисовки улучшенного пикселя с эффектами
-local function draw_enhanced_pixel(draw_list, x, y, pixel)
-    local colors = get_pixel_gradient_colors(pixel.intensity or 0, pixel.alpha)
-    
-    -- Сначала рисуем пульсирующие кольца (на заднем плане)
-    draw_pixel_rings(draw_list, x, y, pixel)
-    
-    -- Рисуем слои свечения с градиентом
-    for layer = PIXEL_CONFIG.glow_layers, 1, -1 do
-        local layer_size = (pixel.size or 1) * (1 + (layer - 1) * 0.5)
-        local layer_alpha = (pixel.alpha or 1.0) / (layer * 1.5)
-        
-        if PIXEL_CONFIG.enable_ellipses and (pixel.intensity or 0) > PIXEL_CONFIG.ellipse_threshold then
-            -- Высокая интенсивность: используем эллипсы для более динамичного вида
-            local ellipse_w = layer_size * 1.2
-            local ellipse_h = layer_size * 0.8
-            local rotation = math.sin(reaper.time_precise() * 3 + pixel.noise_offset) * 0.3
-            
-            reaper.ImGui_DrawList_AddEllipseFilled(draw_list, x, y, ellipse_w, ellipse_h, 
-                get_pixel_color(pixel.intensity or 0, layer_alpha), rotation)
-        else
-            -- Обычная интенсивность: круги
-            reaper.ImGui_DrawList_AddCircleFilled(draw_list, x, y, layer_size, 
-                get_pixel_color(pixel.intensity or 0, layer_alpha))
-        end
-    end
-    
-    -- Добавляем искры для очень ярких пикселей (на переднем плане)
-    if PIXEL_CONFIG.enable_sparks and (pixel.intensity or 0) > PIXEL_CONFIG.spark_threshold and (pixel.alpha or 1.0) > 0.5 then
-        local spark_count = 4
-        local spark_length = (pixel.size or 1) * 2
-        local time_offset = reaper.time_precise() * 5 + (pixel.noise_offset or 0)
-        
-        for i = 1, spark_count do
-            local angle = (i / spark_count) * math.pi * 2 + time_offset
-            local spark_x1 = x + math.cos(angle) * pixel.size
-            local spark_y1 = y + math.sin(angle) * pixel.size
-            local spark_x2 = x + math.cos(angle) * spark_length
-            local spark_y2 = y + math.sin(angle) * spark_length
-            
-            reaper.ImGui_DrawList_AddLine(draw_list, spark_x1, spark_y1, spark_x2, spark_y2,
-                get_pixel_color((pixel.intensity or 0) * 0.8, (pixel.alpha or 1.0) * 0.6), 1.5)
-        end
-    end
-end
-
--- Функция для отрисовки улучшенной частицы (для обратной совместимости)
-local function draw_enhanced_particle(draw_list, x, y, particle)
-    -- Перенаправляем на новую функцию
-    draw_enhanced_pixel(draw_list, x, y, particle)
-end
-
--- Функция обновления системы частиц для трека с жесткими границами
--- Обновляем систему пикселей. Последний параметр `bar_y` (необязательный) –
--- позиция планки уровня dB‑метра, с которой частицы могут сталкиваться и
--- "подталкивать" её. Функция возвращает два значения: текущий уровень сигнала и
--- накопленное смещение планки от столкновений (push offset).
-local function update_pixel_system(track_index, audio_level, delta_time, meter_height, meter_width, meter_x, meter_y, bar_y)
-    -- Инициализируем систему пикселей, если она еще не существует
-    if not pixel_systems[track_index] then
-        init_pixel_system(track_index, meter_width, meter_height)
-    end
-    
-    local system = pixel_systems[track_index]
+    local system = particle_systems[track_index]
     local current_time = reaper.time_precise()
-    local actual_height = meter_height or PIXEL_CONFIG.meter_height
-    local actual_width = meter_width or PIXEL_CONFIG.meter_width
-    local actual_x = meter_x or 0
-    local actual_y = meter_y or 0
+    local actual_height = meter_height or PARTICLE_CONFIG.meter_height
     
-    -- Рассчитываем энергию сигнала для воздействия на пиксели
-    local signal_energy = audio_level * PIXEL_CONFIG.push_force
-    
-    -- Максимальное смещение от столкновений с планкой уровня (инициализируется нулём)
-    local max_push = 0
-
-    -- Обновляем все пиксели в системе (одномерный массив)
-    for i = #system.pixels, 1, -1 do
-        local pixel = system.pixels[i]
+    -- Обновляем существующие частицы
+    for i = #system.particles, 1, -1 do
+        local particle = system.particles[i]
         
-        -- Проверяем, что у пикселя есть все необходимые поля
-        if not pixel.intensity then pixel.intensity = 0 end
-        if not pixel.bounce_energy then pixel.bounce_energy = 0 end
-        if not pixel.velocity_x then pixel.velocity_x = 0 end
-        if not pixel.velocity_y then pixel.velocity_y = 0 end
-        if not pixel.base_x then pixel.base_x = pixel.x end
-        if not pixel.base_y then pixel.base_y = pixel.y end
+        -- Обновляем время жизни
+        particle.life = particle.life * PARTICLE_CONFIG.fade_speed
+        particle.alpha = particle.alpha * PARTICLE_CONFIG.fade_speed
         
-        -- Обновляем интенсивность пикселя (затухание)
-        pixel.intensity = (pixel.intensity or 0) * PIXEL_CONFIG.fade_speed
+        -- Физика движения: подъем с замедлением и падение
+        particle.velocity_y = particle.velocity_y + particle.gravity * delta_time
+        particle.y = particle.y + particle.velocity_y * delta_time
         
-        -- Удаляем слабые пиксели
-        if pixel.intensity < 0.01 then
-            table.remove(system.pixels, i)
-        else
-            -- Добавляем энергию пикселям в зависимости от уровня сигнала
-            if audio_level > 0.01 then
-                local boost = signal_energy * delta_time
-                
-                -- Увеличиваем интенсивность и добавляем энергию для прыжка
-                pixel.intensity = math.min(1.0, (pixel.intensity or 0) + boost)
-                -- Уменьшаем коэффициент добавления энергии для более плавного отскока
-                pixel.bounce_energy = (pixel.bounce_energy or 0) + boost * 20
-            end
-            
-            -- Применяем физику: гравитация
-            pixel.velocity_y = (pixel.velocity_y or 0) + PIXEL_CONFIG.gravity * delta_time
-            
-            -- Добавляем горизонтальное движение для эффекта волны
-            local wave_offset = math.sin(current_time * PIXEL_CONFIG.wave_speed + i * 0.5) * PIXEL_CONFIG.wave_amplitude
-            pixel.velocity_x = wave_offset * delta_time
-            
-            -- Обновляем позицию
-            pixel.x = (pixel.base_x or pixel.x) + (pixel.velocity_x or 0)
-            -- Меньший множитель для vertical displacement делает движение плавнее
-            pixel.y = (pixel.base_y or pixel.y) - (pixel.bounce_energy or 0) * 0.25 + (pixel.velocity_y or 0)
-            
-            -- Проверяем границы метра
-            local margin = 3
-            local min_x = actual_x + margin
-            local max_x = actual_x + actual_width - margin
-            local min_y = actual_y + margin
-            local max_y = actual_y + actual_height - margin
-            
-            -- Ограничиваем движение пикселя в пределах метра
-            if pixel.x < min_x then
-                pixel.x = min_x
-                pixel.velocity_x = -(pixel.velocity_x or 0) * PIXEL_CONFIG.bounce_damping
-            elseif pixel.x > max_x then
-                pixel.x = max_x
-                pixel.velocity_x = -(pixel.velocity_x or 0) * PIXEL_CONFIG.bounce_damping
-            end
-            
-            if pixel.y < min_y then
-                pixel.y = min_y
-                pixel.velocity_y = -(pixel.velocity_y or 0) * PIXEL_CONFIG.bounce_damping
-                pixel.bounce_energy = (pixel.bounce_energy or 0) * PIXEL_CONFIG.bounce_damping
-            elseif pixel.y > max_y then
-                pixel.y = max_y
-                pixel.velocity_y = -(pixel.velocity_y or 0) * PIXEL_CONFIG.bounce_damping
-                pixel.bounce_energy = 0 -- Сбрасываем энергию отскока при достижении дна
-            end
-
-            -- Столкновение с планкой уровня (верхняя граница активного уровня)
-            if bar_y and pixel.y <= bar_y then
-                -- Рассчитываем, насколько пиксель пересёк планку
-                local overshoot = bar_y - pixel.y
-                -- Смещаем пиксель на позицию планки
-                pixel.y = bar_y
-                -- Отбиваем частицу от планки с затуханием
-                pixel.velocity_y = -(pixel.velocity_y or 0) * PIXEL_CONFIG.bounce_damping
-                -- Эффект толчка: масштабируем пересечение
-                local push = (overshoot or 0) * 0.5
-                if push > max_push then
-                    max_push = push
-                end
-                -- Дополнительно уменьшаем энергию отскока после столкновения
-                pixel.bounce_energy = (pixel.bounce_energy or 0) * PIXEL_CONFIG.bounce_damping
-            end
-            
-            -- Постепенно уменьшаем энергию отскока
-            pixel.bounce_energy = (pixel.bounce_energy or 0) * (1 - PIXEL_CONFIG.settle_speed * delta_time)
+        -- "Живое" движение частиц по X
+        local noise_time = current_time * 2 + particle.noise_offset
+        particle.x = particle.base_x + math.sin(noise_time) * PARTICLE_CONFIG.noise_amplitude
+        
+        -- Удаляем частицы, которые упали слишком низко или прожили слишком долго
+        if particle.life < 0.01 or particle.y > actual_height + 10 then
+            table.remove(system.particles, i)
         end
     end
     
-    -- Возвращаем уровень сигнала и максимальное смещение толчка (push offset)
-    return audio_level, max_push
+    -- Добавляем новые частицы в зависимости от уровня аудио
+    -- Увеличиваем чувствительность и количество частиц
+    local particles_to_spawn = math.floor(audio_level * PARTICLE_CONFIG.max_particles * delta_time * 30) -- Увеличено с 20 до 30
+    
+    -- Добавляем базовое количество частиц даже при низком уровне
+    if audio_level > 0.0005 then -- Еще более низкий порог (было 0.001)
+        particles_to_spawn = math.max(particles_to_spawn, 2) -- Минимум 2 частицы при любом сигнале (было 1)
+    end
+    
+    for i = 1, particles_to_spawn do
+        if #system.particles < PARTICLE_CONFIG.max_particles then
+            -- Частицы появляются снизу метра
+            local x = math.random() * PARTICLE_CONFIG.meter_width
+            local y = actual_height - 5 + math.random() * 10 -- Появляются в нижней части метра
+            local intensity = audio_level * (0.5 + math.random() * 0.5) -- Случайная интенсивность
+            
+            table.insert(system.particles, create_particle(x, y, intensity, audio_level))
+        end
+    end
 end
 
--- Функция обновления системы частиц (для обратной совместимости)
-local function update_particle_system(track_index, audio_level, delta_time, meter_height, meter_width, meter_x, meter_y)
-    -- Перенаправляем на новую функцию
-    return update_pixel_system(track_index, audio_level, delta_time, meter_height, meter_width, meter_x, meter_y)
-end
-
--- Функция отрисовки частиц с жестким ограничением внутри метра
--- Функция отрисовки пиксельной системы
-local function draw_pixel_system(ctx, x, y, track_index)
-    if not pixel_systems[track_index] then
+-- Функция отрисовки частиц с эффектом свечения
+local function draw_particle_system(ctx, x, y, track_index)
+    if not particle_systems[track_index] then
         return
     end
     
-    local system = pixel_systems[track_index]
+    local system = particle_systems[track_index]
     local draw_list = reaper.ImGui_GetWindowDrawList(ctx)
     
-    -- Определяем жесткие границы метра для отрисовки
-    local margin = 2
-    local min_x = x + margin
-    local max_x = x + PIXEL_CONFIG.meter_width - margin
-    local min_y = y + margin
-    local max_y = y + PIXEL_CONFIG.meter_height - margin
-    
-    -- Отрисовываем каждый пиксель с несколькими слоями для эффекта свечения (одномерный массив)
-    for _, pixel in ipairs(system.pixels) do
-        -- ЖЕСТКО проверяем, что пиксель находится внутри границ метра
-        if pixel.x >= min_x and pixel.x <= max_x and 
-           pixel.y >= min_y and pixel.y <= max_y then
+    -- Отрисовываем каждую частицу с несколькими слоями для эффекта свечения
+    for _, particle in ipairs(system.particles) do
+        local px = x + particle.x
+        local py = y + particle.y
+        
+        -- Рисуем слои свечения (от большего к меньшему)
+        for layer = PARTICLE_CONFIG.glow_layers, 1, -1 do
+            local layer_size = particle.size * (1 + (layer - 1) * 0.5)
+            local layer_alpha = particle.alpha / (layer * 1.5)
+            local color = get_particle_color(particle.intensity, layer_alpha)
             
-            -- Рисуем слои свечения (от большего к меньшему)
-            for layer = PIXEL_CONFIG.glow_layers, 1, -1 do
-                local pixel_size = PIXEL_CONFIG.pixel_size
-                local layer_size = pixel_size * (1 + (layer - 1) * 0.5)
-                local layer_alpha = (pixel.alpha or 1.0) / (layer * 1.5)
-                local color = get_pixel_color(pixel.intensity or 0, layer_alpha)
-                
-                -- Рисуем пиксель как заполненный круг
-                reaper.ImGui_DrawList_AddCircleFilled(draw_list, pixel.x, pixel.y, layer_size, color)
-            end
+            -- Рисуем частицу как заполненный круг
+            reaper.ImGui_DrawList_AddCircleFilled(draw_list, px, py, layer_size, color)
         end
     end
-end
-
--- Функция отрисовки системы частиц (для обратной совместимости)
-local function draw_particle_system(ctx, x, y, track_index)
-    -- Перенаправляем на новую функцию
-    draw_pixel_system(ctx, x, y, track_index)
 end
 
 -- Функция получения уровня аудио трека
 local function get_track_audio_level(track_index)
-    -- Проверяем корректность track_index
-    if not track_index or type(track_index) ~= "number" then
-        return 0
-    end
-    
     if track_index == 0 then
         -- Мастер трек (i == 0)
         local master_track = reaper.GetMasterTrack(0)
         if master_track then
-            local peak_l = reaper.Track_GetPeakInfo(master_track, 0) or 0
-            local peak_r = reaper.Track_GetPeakInfo(master_track, 1) or 0
+            local peak_l = reaper.Track_GetPeakInfo(master_track, 0)
+            local peak_r = reaper.Track_GetPeakInfo(master_track, 1)
             local max_peak = math.max(peak_l, peak_r)
             -- Применяем усиление для лучшей видимости, но не ограничиваем максимум
             local amplified_level = max_peak * 2.5
@@ -1317,8 +307,8 @@ local function get_track_audio_level(track_index)
         -- Обычный трек (i >= 1, поэтому track_index - 1 для получения правильного трека)
         local track = reaper.GetTrack(0, track_index - 1)
         if track then
-            local peak_l = reaper.Track_GetPeakInfo(track, 0) or 0
-            local peak_r = reaper.Track_GetPeakInfo(track, 1) or 0
+            local peak_l = reaper.Track_GetPeakInfo(track, 0)
+            local peak_r = reaper.Track_GetPeakInfo(track, 1)
             local max_peak = math.max(peak_l, peak_r)
             -- Применяем усиление для лучшей видимости, но не ограничиваем максимум
             local amplified_level = max_peak * 2.5
@@ -1332,171 +322,84 @@ local function get_track_audio_level(track_index)
     return 0
 end
 
--- FL-style функция обновления частиц с жесткими границами метра
-function UpdateFXParticlesFL(track_index, level, meter_x, meter_y, meter_width, meter_height, handle_y)
-    -- Используем пиксельную систему вместо fx_particles
-    local system = init_pixel_system(track_index, meter_width, meter_height)
-    local current_time = reaper.time_precise()
-    local delta_time = 1.0 / 60.0
-    
-    -- Определяем границы метра используя ImGui.GetItemRectMin/Max подход
-    local margin = 3
-    local meter_min_x = meter_x + margin
-    local meter_max_x = meter_x + meter_width - margin
-    local meter_min_y = meter_y + margin
-    local meter_max_y = meter_y + meter_height - margin
-    
-    -- Фильтрация мертвых частиц и обновление живых
-    for i = #system.pixels, 1, -1 do
-        local particle = system.pixels[i]
-        
-        -- Обновляем время жизни частицы
-        particle.life = particle.life - delta_time
-        
-        -- Простая физика: движение вверх с гравитацией
-        particle.velocity_y = particle.velocity_y + particle.gravity * delta_time
-        local new_y = particle.y + particle.velocity_y * delta_time
-        
-        -- Обновляем горизонтальную позицию с учетом velocity_x
-        local new_x = particle.x + particle.velocity_x * delta_time
-        
-        -- Обновляем позицию
-        particle.x = new_x
-        particle.y = new_y
-        
-        -- Отскоки от границ метра (как в GPTDb метр новый)
-        -- Отскок от левой и правой стенок
-        if particle.x <= meter_min_x or particle.x >= meter_max_x then
-            particle.velocity_x = -particle.velocity_x * 0.5  -- Отскок с затуханием
-            particle.x = math.max(meter_min_x, math.min(meter_max_x, particle.x))
-        end
-        
-        -- Отскок от верха и низа метра
-        if particle.y <= meter_min_y then
-            particle.velocity_y = -particle.velocity_y * 0.5  -- Отскок от верха
-            particle.y = meter_min_y
-        elseif particle.y >= meter_max_y then
-            particle.velocity_y = -particle.velocity_y * 0.5  -- Отскок от низа
-            particle.y = meter_max_y
-            -- Добавляем небольшое боковое отклонение при отскоке от дна
-            particle.velocity_x = particle.velocity_x + (math.random() - 0.5) * 5
-        end
-        
-        -- Взаимодействие с ползунком дБ (если позиция передана)
-        if handle_y and particle.velocity_y < 0 then  -- Частица движется вверх
-            local handle_tolerance = 5  -- Толщина области взаимодействия с ползунком
-            -- Проверяем, находится ли частица в зоне ползунка
-            if particle.y <= handle_y + handle_tolerance and particle.y >= handle_y - handle_tolerance then
-                -- Отскок от ползунка вниз
-                particle.velocity_y = -math.abs(particle.velocity_y) * 0.8  -- Отскок вниз с затуханием
-                particle.y = handle_y + handle_tolerance  -- Позиционируем ниже ползунка
-                -- Добавляем небольшое боковое отклонение при отскоке от ползунка
-                particle.velocity_x = particle.velocity_x + (math.random() - 0.5) * 10
-            end
-        end
-        
-        -- Затухание скоростей
-        particle.velocity_x = particle.velocity_x * 0.98
-        particle.velocity_y = particle.velocity_y * 0.995
-        
-        -- Обновляем альфа-канал (затухание)
-        particle.alpha = particle.alpha * PIXEL_CONFIG.fade_speed
-        
-        -- Удаляем мертвые частицы (вышедшие за границы, прозрачные или проживших слишком долго)
-        local out_of_bounds = particle.x < meter_min_x or particle.x > meter_max_x or
-                             particle.y < meter_min_y or particle.y > meter_max_y
-        local is_dead = out_of_bounds or particle.alpha < 0.01 or particle.life <= 0
-        
-        if is_dead then
-            table.remove(system.pixels, i)
-        end
-    end
-    
-    -- Создаем новые частицы на основе уровня аудио
-    local particles_to_create = 0
-    if level > 0.001 then
-        particles_to_create = math.floor(level * PIXEL_CONFIG.max_particles * delta_time * 20)
-        particles_to_create = math.max(1, particles_to_create)
-    end
-    
-    -- ВРЕМЕННО ОТКЛЮЧЕНО: создание кластера пикселей
-    --[[
-    for i = 1, particles_to_create do
-        if #system.pixels < PIXEL_CONFIG.max_particles then
-            -- Создаем частицы строго в пределах meter_min/max границ
-            local safe_width = meter_max_x - meter_min_x
-            local safe_height = meter_max_y - meter_min_y
-            
-            if safe_width > 0 and safe_height > 0 then
-                local pixel_x = meter_min_x + (math.random() * safe_width)
-            local pixel_y = meter_max_y - (math.random() * 10) -- Появляются в нижней части
-            local pixel = create_pixel(
-                pixel_x, pixel_y, level, level, 
-                meter_width, meter_min_x, meter_min_y, meter_height
-            )
-            
-            -- Устанавливаем базовую позицию для движения в безопасной зоне
-            pixel.base_x = pixel_x
-            
-            table.insert(system.pixels, pixel)
-            end
-        end
-    end
-    --]]
-    
-    return 0  -- Возвращаем 0 вместо сложного расчета давления
-end
-
--- Функция отрисовки пиксельной системы
-function DrawPixelSystem(track_index, draw_list, meter_x, meter_y, meter_width, meter_height)
-    if not pixel_systems[track_index] then
-        return
-    end
-    
-    local system = pixel_systems[track_index]
-    
-    -- Границы метра
-    local margin = 3
-    local meter_min_x = meter_x + margin
-    local meter_max_x = meter_x + meter_width - margin
-    local meter_min_y = meter_y + margin
-    local meter_max_y = meter_y + meter_height - margin
-    
-    -- Отрисовываем пиксели в стиле LED / LCD
-    for _, pixel in ipairs(system.pixels) do
-        local intensity = pixel.intensity or 0
-        -- фильтруем слишком слабые пиксели
-        if intensity > 0.01 then
-            -- абсолютные координаты пикселя
-            local abs_x = pixel.x
-            local abs_y = pixel.y
-            -- проверяем, что пиксель внутри границ метра
-            if abs_x >= meter_min_x and abs_x <= meter_max_x and 
-               abs_y >= meter_min_y and abs_y <= meter_max_y then
-                -- выбираем размер LED‑пикселя (используем размер частицы или конфиг)
-                local size = pixel.size or PIXEL_CONFIG.pixel_size
-                -- координаты левого верхнего угла для функции draw_lcd_pixel
-                local px = abs_x - size/2
-                local py = abs_y - size/2
-                -- вычисляем частотный коэффициент по вертикальному положению: нижняя часть → низкие частоты (0), верхняя → высокие (1)
-                local freq_factor = 0.0
-                local denom = meter_max_y - meter_min_y
-                if denom > 0 then
-                    freq_factor = math.max(0.0, math.min(1.0, (meter_max_y - abs_y) / denom))
-                end
-                -- рисуем LED‑пиксель с использованием функции draw_lcd_pixel
-                draw_lcd_pixel(draw_list, px, py, size, size, intensity, freq_factor)
-            end
-        end
-    end
-end
-
--- Функция очистки неиспользуемых систем пикселей
-local function cleanup_pixel_systems(max_track_count)
-    for track_index in pairs(pixel_systems) do
+-- Функция очистки неиспользуемых систем частиц
+local function cleanup_particle_systems(max_track_count)
+    for track_index in pairs(particle_systems) do
         if track_index > max_track_count then
-            pixel_systems[track_index] = nil
+            particle_systems[track_index] = nil
+            last_update_times[track_index] = nil
         end
+    end
+end
+
+-- ===== dB Meter Particle System =====
+
+-- Глобальная таблица частиц для dB-планки
+fx_particles = {}
+
+-- Обновление частиц и расчёт давления для трека
+local function UpdateFXParticlesFL(track_idx, level, x, y_bottom, width, height)
+    if level <= 0 then return 0 end
+    local system = fx_particles[track_idx]
+    if not system then
+        system = { particles = {}, last = reaper.time_precise(), y_bottom = y_bottom }
+        fx_particles[track_idx] = system
+    end
+    system.y_bottom = y_bottom
+    local t = reaper.time_precise()
+    local dt = t - system.last
+    system.last = t
+
+    local particles = system.particles
+
+    -- Спавним новые частицы при наличии сигнала
+    if level > 0.01 then
+        local spawn = math.min(math.floor(level * 20), 120 - #particles)
+        for i = 1, spawn do
+            local p = {
+                x = x + width / 2 + (math.random() - 0.5) * width,
+                y = 0,
+                vx = (math.random() - 0.5) * 15,
+                vy = (60 + 200 * level) * (0.8 + math.random() * 0.4),
+                alpha = 1,
+                force = level * 100
+            }
+            particles[#particles + 1] = p
+        end
+    end
+
+    local pressure = 0
+    for i = #particles, 1, -1 do
+        local p = particles[i]
+        p.vy = p.vy - 300 * dt
+        p.y = p.y + p.vy * dt
+        p.x = p.x + p.vx * dt
+        p.alpha = p.alpha * 0.96
+        if p.y <= 0 or p.alpha < 0.01 then
+            table.remove(particles, i)
+        else
+            if p.y < 15 then
+                pressure = pressure + p.force * (15 - p.y) / 15
+            end
+        end
+    end
+
+    return pressure
+end
+
+-- Отрисовка частиц dB-планки
+local function DrawFXParticles(track_idx, draw_list)
+    local system = fx_particles[track_idx]
+    if not system then return end
+    local y_bottom = system.y_bottom
+    for _, p in ipairs(system.particles) do
+        local px = p.x
+        local py = y_bottom - p.y
+        local size = 2 + p.force * 0.02
+        local tail_color = ImColor(0.8, 0.9, 1.0, p.alpha * 0.3)
+        local head_color = ImColor(0.3, 0.7, 1.0, p.alpha)
+        reaper.ImGui_DrawList_AddCircleFilled(draw_list, px, py, size * 1.5, tail_color)
+        reaper.ImGui_DrawList_AddCircleFilled(draw_list, px, py, size, head_color)
     end
 end
 
@@ -1505,20 +408,20 @@ local function draw_spectrum_meter(ctx, x, y, track_index, meter_height)
     local draw_list = reaper.ImGui_GetWindowDrawList(ctx)
     
     -- Используем переданную высоту или значение по умолчанию
-    local actual_height = meter_height or PIXEL_CONFIG.meter_height
+    local actual_height = meter_height or PARTICLE_CONFIG.meter_height
     
-    -- Фон метра: рисуем чёрную заливку, чтобы дым и пиксели отображались на темном фоне
-    local bg_color = 0x000000FF
+    -- Фон метра
+    local bg_color = 0x202020FF
     reaper.ImGui_DrawList_AddRectFilled(draw_list, 
         x, y, 
-        x + PIXEL_CONFIG.meter_width, y + actual_height, 
+        x + PARTICLE_CONFIG.meter_width, y + actual_height, 
         bg_color, 2)
     
     -- Рамка метра
     local border_color = 0x404040FF
     reaper.ImGui_DrawList_AddRect(draw_list, 
         x, y, 
-        x + PIXEL_CONFIG.meter_width, y + actual_height, 
+        x + PARTICLE_CONFIG.meter_width, y + actual_height, 
         border_color, 2, 0, 1)
     
     -- Рисуем дБ шкалу (как в слайдере громкости)
@@ -1535,20 +438,20 @@ local function draw_spectrum_meter(ctx, x, y, track_index, meter_height)
             if db_val == 0 then
                 -- 0dB - более заметная отметка (как в слайдере)
                 reaper.ImGui_DrawList_AddLine(draw_list, 
-                    x + PIXEL_CONFIG.meter_width + 2, mark_y, 
-                    x + PIXEL_CONFIG.meter_width + 6, mark_y, 
+                    x + PARTICLE_CONFIG.meter_width + 2, mark_y, 
+                    x + PARTICLE_CONFIG.meter_width + 6, mark_y, 
                     0x808080FF, 2)
             elseif db_val % 12 == 0 then
                 -- Основные отметки (каждые 12dB)
                 reaper.ImGui_DrawList_AddLine(draw_list, 
-                    x + PIXEL_CONFIG.meter_width + 2, mark_y, 
-                    x + PIXEL_CONFIG.meter_width + 5, mark_y, 
+                    x + PARTICLE_CONFIG.meter_width + 2, mark_y, 
+                    x + PARTICLE_CONFIG.meter_width + 5, mark_y, 
                     0x606060FF, 1)
             else
                 -- Промежуточные отметки
                 reaper.ImGui_DrawList_AddLine(draw_list, 
-                    x + PIXEL_CONFIG.meter_width + 2, mark_y, 
-                    x + PIXEL_CONFIG.meter_width + 4, mark_y, 
+                    x + PARTICLE_CONFIG.meter_width + 2, mark_y, 
+                    x + PARTICLE_CONFIG.meter_width + 4, mark_y, 
                     0x404040FF, 1)
             end
         end
@@ -1562,226 +465,43 @@ local function draw_spectrum_meter(ctx, x, y, track_index, meter_height)
     -- Получаем уровень аудио и обновляем частицы
     local current_time = reaper.time_precise()
     local delta_time = current_time - last_update_times[track_index]
-    local audio_level = get_track_audio_level(track_index) or 0
+    local audio_level = get_track_audio_level(track_index)
     
-    -- Вычисляем позицию планки уровня сигнала для передачи в систему частиц
-    local signal_level_y = y + actual_height -- По умолчанию внизу метра
-    if audio_level and audio_level > 0.00001 then
-        local level_db = 20 * (math.log(audio_level) / math.log(10))
-        local min_db = -60
-        local max_db = 12
-        level_db = math.max(min_db, math.min(max_db, level_db))
-        local level_normalized = (level_db - min_db) / (max_db - min_db)
-        signal_level_y = y + (1 - level_normalized) * actual_height
-    end
-    
-    -- Сохраняем предыдущее смещение планки для корректной физики столкновений
-    local prev_push = pixel_push_offsets[track_index] or 0
-    -- Планка, используемая для системы частиц: учитывает предыдущее смещение
-    local bar_y_for_bounce = signal_level_y - prev_push
-    -- Обновляем системы тумана и вспрыгивающих пикселей и сохраняем смещение от столкновений
-    local push_offset = 0
-    if delta_time > 1.0 / PIXEL_CONFIG.update_rate then
-        -- Обновляем густой туман: частицы колышутся, но не выходят за планку и рамки
-        update_fog_system(track_index, audio_level, delta_time, x, y, PIXEL_CONFIG.meter_width, actual_height, bar_y_for_bounce)
-        -- Обновляем bounce‑систему: частицы выпрыгивают из верхней части тумана и отскакивают от планки
-        local new_push = update_bounce_system(track_index, audio_level, delta_time, bar_y_for_bounce, x, y, PIXEL_CONFIG.meter_width, actual_height)
-        push_offset = new_push or 0
-        -- Запоминаем новое смещение, чтобы в следующем кадре корректно определять планку столкновений
-        pixel_push_offsets[track_index] = push_offset
+    if delta_time > 1.0 / PARTICLE_CONFIG.update_rate then
+        update_particle_system(track_index, audio_level, delta_time, actual_height)
         last_update_times[track_index] = current_time
     end
-    -- Рисуем туман под планкой
-    draw_fog_system(ctx, x, y, track_index, PIXEL_CONFIG.meter_width, actual_height)
-    -- Рисуем вспрыгивающие пиксели поверх тумана
-    draw_bounce_system(ctx, track_index, x, y, PIXEL_CONFIG.meter_width, actual_height)
-    -- Рисуем линию индикатора уровня дБ (планка). Используем signal_level_y и push_offset
-    do
-        local bar_y_draw = signal_level_y - (push_offset or 0)
-        if bar_y_draw < y then bar_y_draw = y end
-        reaper.ImGui_DrawList_AddLine(draw_list,
-            x + 2, bar_y_draw,
-            x + PIXEL_CONFIG.meter_width - 2, bar_y_draw,
-            0x00FFFFFF, 1)
-    end
     
-    -- СПЕКТРОАНАЛИЗАТОР: рисуем столбики пикселей для разных частотных полос
-    -- Отключено (условие всегда false), чтобы под планкой не появлялось синее закрашивание
-    if false and audio_level and audio_level > 0.00001 then
-        -- audio_level приходит как линейное значение амплитуды от Track_GetPeakInfo
-        -- Преобразуем в дБ как в Reaper: dB = 20 * log10(amplitude)
+    -- Отрисовываем индикацию уровня сигнала
+    if audio_level > 0.00001 then
+        -- audio_level приходит как линейное значение амплитуды
         local level_db = 20 * (math.log(audio_level) / math.log(10))
-        
-        -- Ограничиваем диапазон отображения
+
         local min_db = -60
         local max_db = 12
         level_db = math.max(min_db, math.min(max_db, level_db))
-        
-        -- Нормализуем уровень (0 = тишина, 1 = максимум)
+
         local level_normalized = (level_db - min_db) / (max_db - min_db)
-        
-        -- Вычисляем позицию планки уровня сигнала
-        local level_y = y + (1 - level_normalized) * actual_height
-        -- Смещение планки от всплесков частиц (push_offset)
-        level_y = level_y - (push_offset or 0)
-        if level_y < y then level_y = y end
-        
-        -- Настройки спектроанализатора
-        local num_columns = 8           -- Количество частотных полос (столбцов)
-        local column_gap = 1            -- Зазор между столбцами
-        local pixel_height = 3          -- Высота одного пикселя
-        local pixel_gap = 1             -- Зазор между пикселями в столбце
-        local pixel_step = pixel_height + pixel_gap
-        
-        -- Вычисляем ширину одного столбца
-        local total_gaps = (num_columns - 1) * column_gap
-        local available_width = PIXEL_CONFIG.meter_width - 2 - total_gaps  -- -2 для отступов по краям
-        local column_width = math.floor(available_width / num_columns)
-        
-        -- Максимальное количество пикселей в столбце (ограничено планкой)
-        local max_pixels_in_column = math.floor(actual_height / pixel_step)
-        local level_pixels_limit = math.floor((y + actual_height - level_y) / pixel_step)
-        
-        -- Advanced spectrum animation with JSFX-inspired techniques
-        local current_time_ms = reaper.time_precise() * 1000
-        local dt = current_time_ms - last_spectrum_time
-        last_spectrum_time = current_time_ms
-        
-        -- Инициализируем буферы для данного трека
-        if not spectrum_column_levels[track_index] then
-            spectrum_column_levels[track_index] = {}
-            spectrum_integration_buffer[track_index] = {}
-            spectrum_peak_hold[track_index] = {}
-            spectrum_fall_rate[track_index] = {}
-            for i = 1, num_columns do
-                spectrum_column_levels[track_index][i] = 0
-                spectrum_integration_buffer[track_index][i] = 0
-                spectrum_peak_hold[track_index][i] = {value = 0, time = 0}
-                spectrum_fall_rate[track_index][i] = 0
-            end
-        end
-        
-        -- Отрисовываем каждый столбец (частотную полосу)
-        for col = 1, num_columns do
-            -- Позиция столбца
-            local column_x = x + 1 + (col - 1) * (column_width + column_gap)
-            
-            -- Симулируем разные частотные полосы
-            local frequency_factor = col / num_columns  -- 0.125 до 1.0
-            
-            -- Создаем целевой уровень для каждой частотной полосы
-            local base_level = level_normalized
-            
-            -- Добавляем очень мягкие частотно-зависимые вариации
-            local freq_variation = 1.0
-            if frequency_factor < 0.3 then
-                -- Низкие частоты: больше энергии при басах
-                freq_variation = 0.98 + math.random() * 0.04 + base_level * 0.05
-            elseif frequency_factor < 0.7 then
-                -- Средние частоты: стабильные
-                freq_variation = 0.96 + math.random() * 0.06 + base_level * 0.08
-            else
-                -- Высокие частоты: более хаотичные, но очень мягко
-                freq_variation = 0.94 + math.random() * 0.08 + base_level * 0.04
-            end
-            
-            -- Минимальные временные флуктуации
-            local time_factor = math.sin(current_time * (0.2 + frequency_factor * 0.5)) * 0.02 + 1.0
-            local raw_level = math.min(1.0, base_level * freq_variation * time_factor)
-            
-            -- Apply frequency slope compensation (subtle)
-            local target_level = apply_frequency_slope(raw_level, col, num_columns, 1.0)
-            
-            -- Integration smoothing (like JSFX integration_time)
-            local integration_rate = 5000.0 / math.max(integration_time, 1)
-            spectrum_integration_buffer[track_index][col] = exponential_smooth(
-                spectrum_integration_buffer[track_index][col], 
-                target_level, 
-                integration_rate, 
-                dt
-            )
-            
-            local integrated_level = spectrum_integration_buffer[track_index][col]
-            
-            -- Peak hold with decay
-            local peak_data = spectrum_peak_hold[track_index][col]
-            if integrated_level > peak_data.value then
-                peak_data.value = integrated_level
-                peak_data.time = current_time_ms
-            elseif current_time_ms - peak_data.time > peak_hold_time then
-                -- Peak decay
-                local decay_rate = 2.0  -- dB/sec equivalent
-                peak_data.value = exponential_smooth(peak_data.value, integrated_level, decay_rate, dt)
-            end
-            
-            -- Adaptive fall rate (faster for sudden drops, slower for gradual)
-            local current_level = spectrum_column_levels[track_index][col] or 0
-            local level_diff = integrated_level - current_level
-            
-            local fall_rate_base = 4.0  -- Base fall rate
-            local rise_rate = 10.0      -- Rise rate
-            
-            if level_diff > 0 then
-                -- Rising: use rise rate
-                spectrum_fall_rate[track_index][col] = rise_rate
-            else
-                -- Falling: adaptive rate based on difference magnitude
-                local adaptive_factor = math.min(math.abs(level_diff) * 8, 3.0)
-                spectrum_fall_rate[track_index][col] = fall_rate_base * (1 + adaptive_factor)
-            end
-            
-            -- Apply smoothing with adaptive rate
-            spectrum_column_levels[track_index][col] = exponential_smooth(
-                current_level, 
-                integrated_level, 
-                spectrum_fall_rate[track_index][col], 
-                dt
-            )
-            
-            local smooth_level = spectrum_column_levels[track_index][col]
-            
-            -- Вычисляем количество активных пикселей (ограничено планкой)
-            local target_pixels = math.floor(smooth_level * max_pixels_in_column)
-            local active_pixels = math.min(target_pixels, level_pixels_limit)
-            
-            -- Отрисовываем LCD пиксели в столбце снизу вверх
-            for pixel_row = 1, active_pixels do
-                local pixel_y = y + actual_height - pixel_row * pixel_step
-                
-                -- ВАЖНО: Проверяем, что пиксель не выше планки уровня
-                if pixel_y >= level_y then
-                    -- Определяем интенсивность пикселя в зависимости от позиции в столбце
-                    local pixel_position = pixel_row / math.max(1, active_pixels)
-                    local base_intensity = 1.0 - pixel_position * 0.2  -- Уменьшен градиент для большей яркости
-                    base_intensity = math.max(0.4, base_intensity)  -- Минимальная яркость увеличена
-                    
-                    -- Используем LCD эффект вместо обычных пикселей с увеличенной яркостью
-                    draw_lcd_pixel(draw_list, column_x, pixel_y, column_width, pixel_height, 
-                                 base_intensity * 1.2, frequency_factor)  -- Дополнительное увеличение яркости
-                end
-            end
-            
-            -- Индикатор удержания пика (LCD стиль)
-            local peak_level = peak_data.value
-            if peak_level > 0.01 and peak_level > smooth_level + 0.03 then
-                local peak_y = y + actual_height - math.floor(peak_level * max_pixels_in_column) * pixel_step
-                if peak_y >= level_y then
-                    -- Используем LCD пиксель для пика с оранжевым цветом
-                    -- Создаем специальный frequency_factor для оранжевого цвета
-                    local orange_freq_factor = 0.15  -- Это даст оранжевый цвет в нашей LCD палитре
-                    draw_lcd_pixel(draw_list, column_x, peak_y, column_width, pixel_height, 
-                                 1.0, orange_freq_factor)  -- Максимальная интенсивность для пика
-                end
-            end
-        end
-        
-        -- Яркая линия на уровне сигнала (поверх пикселей)
-        local line_color = 0x00FFFFFF  -- Яркий cyan
-        reaper.ImGui_DrawList_AddLine(draw_list, 
-            x + 2, level_y, 
-            x + PIXEL_CONFIG.meter_width - 2, level_y, 
-            line_color, 1)
+
+        local pressure = UpdateFXParticlesFL(track_index, level_normalized, x, y + actual_height, PARTICLE_CONFIG.meter_width, actual_height)
+        DrawFXParticles(track_index, draw_list)
+        local offset = math.min(pressure * 0.01, 6)
+
+        local top_col = ImColor(0.8, 0.9, 1.0, 0.9)
+        local bot_col = ImColor(0.3, 0.7, 1.0, 0.9)
+        reaper.ImGui_DrawList_AddRectFilledMultiColor(draw_list,
+            x,
+            y + actual_height - level_normalized * actual_height - offset,
+            x + PARTICLE_CONFIG.meter_width,
+            y + actual_height - offset,
+            top_col, top_col, bot_col, bot_col)
+    else
+        -- также обновляем, чтобы частицы затухали
+        UpdateFXParticlesFL(track_index, 0, x, y + actual_height, PARTICLE_CONFIG.meter_width, actual_height)
+        DrawFXParticles(track_index, draw_list)
     end
+
+    draw_particle_system(ctx, x, y, track_index)
 end
 
 -- Функция отрисовки градиентного фона трека с цветами Reaper
@@ -3882,14 +2602,9 @@ local function draw_send_ring_control(ctx, cx, cy, size, send_level, has_send, i
     end
 end
 
-local function fl_vslider(ctx, label, width, height, value, min_val, max_val, track_index, pressure_offset)
+local function fl_vslider(ctx, label, width, height, value, min_val, max_val, track_index)
     local draw_list = reaper.ImGui_GetWindowDrawList(ctx)
     local pos_x, pos_y = reaper.ImGui_GetCursorScreenPos(ctx)
-    
-    -- Применяем смещение от давления частиц (ограничиваем максимальное смещение)
-    pressure_offset = pressure_offset or 0
-    local max_offset = 6
-    pressure_offset = math.min(pressure_offset * 0.01, max_offset)
     
     -- Вычисляем нормализованное значение
     local normalized = (value - min_val) / (max_val - min_val)
@@ -3928,26 +2643,14 @@ local function fl_vslider(ctx, label, width, height, value, min_val, max_val, tr
         end
     end
     
-    -- Вычисляем позицию ползунка (маленький прямоугольник) с учетом смещения от частиц
+    -- Вычисляем позицию ползунка (маленький прямоугольник)
     local handle_height = 4
     local handle_width = width - 4
-    local handle_y = pos_y + (1 - normalized) * (height - handle_height) - pressure_offset
+    local handle_y = pos_y + (1 - normalized) * (height - handle_height)
     local handle_x = pos_x + 2
     
-    -- Рисуем ползунок (светло-серый) с эффектом тряски от частиц
-    local shake_intensity = pressure_offset * 0.3
-    local shake_x = handle_x + (math.random() - 0.5) * shake_intensity
-    local shake_y = handle_y + (math.random() - 0.5) * shake_intensity
-    
-    -- Основной ползунок
-    reaper.ImGui_DrawList_AddRectFilled(draw_list, shake_x, shake_y, shake_x + handle_width, shake_y + handle_height, 0xC0C0C0FF, 0)
-    
-    -- Дополнительный эффект свечения при высоком давлении
-    if pressure_offset > 2 then
-        local glow_alpha = math.min(pressure_offset / 6, 1) * 0.3
-        local glow_color = (0xFF << 24) | (math.floor(255 * glow_alpha) << 16) | (math.floor(255 * glow_alpha) << 8) | math.floor(255 * glow_alpha)
-        reaper.ImGui_DrawList_AddRectFilled(draw_list, handle_x - 1, handle_y - 1, handle_x + handle_width + 1, handle_y + handle_height + 1, glow_color, 0)
-    end
+    -- Рисуем ползунок (светло-серый)
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, handle_x, handle_y, handle_x + handle_width, handle_y + handle_height, 0xC0C0C0FF, 0)
     
     -- Создаем невидимую кнопку для взаимодействия
     reaper.ImGui_InvisibleButton(ctx, label, width, height)
@@ -3972,8 +2675,7 @@ local function fl_vslider(ctx, label, width, height, value, min_val, max_val, tr
         new_value = math.max(min_val, math.min(max_val, new_value))
     end
     
-    -- Возвращаем также позицию ползунка для взаимодействия с частицами
-    return new_value ~= value, new_value, handle_y
+    return new_value ~= value, new_value
 end
 
 local function draw_circle_arrow(draw_list, cx, cy, size, color)
@@ -4214,21 +2916,6 @@ local function loop()
         reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_WindowBg(), COLOR_BG)
         reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ChildBg(), COLOR_BG)
         
-        -- Кнопка для открытия панели настроек частиц
-        if reaper.ImGui_Button(ctx, "Particle Settings (P)", 140, 20) then
-            show_particle_settings = not show_particle_settings
-        end
-        if reaper.ImGui_IsItemHovered(ctx) then
-            reaper.ImGui_SetTooltip(ctx, "Open particle effects settings panel\nHotkey: P")
-        end
-        reaper.ImGui_SameLine(ctx)
-        reaper.ImGui_Text(ctx, "FL Mixer Enhanced")
-        
-        -- Горячая клавиша P для открытия панели настроек частиц
-        if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_P()) then
-            show_particle_settings = not show_particle_settings
-        end
-        
         update_selected_from_reaper()
         update_track_info()
         
@@ -4328,7 +3015,7 @@ local function loop()
         end
         
         -- Очищаем неиспользуемые системы частиц
-        cleanup_pixel_systems(track_count)
+        cleanup_particle_systems(track_count)
         
         for i = 0, track_count do
             local send_icon_clicked = false  -- Переменная для отслеживания кликов по иконке сенда
@@ -4653,51 +3340,17 @@ local function loop()
             local slider_x = (width - SLIDER_WIDTH) / 2 + 8  -- Смещен на 8 пикселей вправо
             
             -- =========== СПЕКТРАЛЬНЫЙ МЕТР (слева от слайдера) ===========
-            local spectrum_meter_x = slider_x - PIXEL_CONFIG.meter_width - 8  -- 8 пикселей отступа от слайдера
+            local spectrum_meter_x = slider_x - PARTICLE_CONFIG.meter_width - 8  -- 8 пикселей отступа от слайдера
             local spectrum_meter_y = reaper.ImGui_GetCursorPosY(ctx)
             
-            -- Получаем уровень трека для частиц
-            local level = get_track_audio_level(i) or 0
-            
-            -- Вычисляем базовые координаты метра
-            local base_meter_x = window_x + spectrum_meter_x
-            local base_meter_y = window_y + spectrum_meter_y
-            local meter_width = PIXEL_CONFIG.meter_width
-            local meter_height = slider_height
-            
-            -- 1. Сначала отрисовываем спектральный метр
-            draw_spectrum_meter(ctx, base_meter_x, base_meter_y, i, meter_height)
-            
-            -- 2. Получаем точные координаты метра ПОСЛЕ его отрисовки
-            local meter_min_x = base_meter_x
-            local meter_min_y = base_meter_y  
-            local meter_max_x = base_meter_x + meter_width
-            local meter_max_y = base_meter_y + meter_height
-            
-            -- 3. Затем обновляем и отрисовываем пиксели с точными координатами
-            -- используем функцию UpdateFXParticlesFL, которая порождает новые частицы для dB‑метра
-            -- Используем сохраненную позицию слайдера из предыдущего кадра
-            local saved_handle_y = handle_positions[i] or (meter_min_y + meter_height * 0.8) -- fallback позиция
-            local pressure = UpdateFXParticlesFL(i, level, 
-                meter_min_x, 
-                meter_min_y,
-                meter_width, 
-                meter_height,
-                saved_handle_y)
-            
-            -- Отрисовываем пиксельную систему ПОСЛЕ метра, чтобы она была поверх
-            DrawPixelSystem(i, reaper.ImGui_GetWindowDrawList(ctx), 
-                meter_min_x, 
-                meter_min_y, 
-                meter_width, 
-                meter_height)
+            -- Отрисовываем спектральный метр с высотой, соответствующей слайдеру
+            local meter_height = slider_height  -- Используем ту же высоту, что и у слайдера
+            draw_spectrum_meter(ctx, window_x + spectrum_meter_x, window_y + spectrum_meter_y, i, meter_height)
             -- =========== /СПЕКТРАЛЬНЫЙ МЕТР ===========
             
             reaper.ImGui_SetCursorPosX(ctx, slider_x)
             
-            local rv, new_vol_db, handle_y = fl_vslider(ctx, 'Vol##'..i, SLIDER_WIDTH, slider_height, vol_db, -60, 12, i, pressure)
-            -- Сохраняем позицию слайдера для использования в UpdateFXParticlesFL
-            handle_positions[i] = handle_y
+            local rv, new_vol_db = fl_vslider(ctx, 'Vol##'..i, SLIDER_WIDTH, slider_height, vol_db, -60, 12, i)
 
             -- Контекстное меню при правом клике на слайдер
             if reaper.ImGui_IsItemHovered(ctx) and reaper.ImGui_IsMouseClicked(ctx, 1) then
@@ -5977,25 +4630,12 @@ local function loop()
     if ctx then
         reaper.ImGui_End(ctx)
     end
-    
-    -- Панель настроек частиц
-    if ctx then
-        draw_particle_settings_panel()
-    end
-    
     if open then
         reaper.defer(loop)
     else
-        -- Очистка основного контекста
         if ctx and type(reaper.ImGui_DestroyContext) == "function" then
             reaper.ImGui_DestroyContext(ctx)
             ctx = nil
-        end
-        
-        -- Очистка контекста частиц
-        if particle_ctx and type(reaper.ImGui_DestroyContext) == "function" then
-            reaper.ImGui_DestroyContext(particle_ctx)
-            particle_ctx = nil
         end
     end
 end
